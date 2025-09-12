@@ -2,7 +2,6 @@ streamlit
 pandas
 numpy
 datetime
-concurrent
 typing
 yahooquery
 tqdm 
