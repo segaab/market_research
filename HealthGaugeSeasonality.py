@@ -1,4 +1,3 @@
-# ────────── Chunk 1 ──────────
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -7,6 +6,9 @@ from yahooquery import Ticker
 import concurrent.futures
 from datetime import datetime
 import plotly.express as px
+import json
+
+
 
 # --- Asset definitions ---
 ASSET_LEADERS = {
@@ -47,13 +49,15 @@ def fetch_single(ticker):
     df = t.history(start=START_DATE, end=END_DATE)
     if df.empty:
         return ticker, pd.DataFrame()
+    
     df.reset_index(inplace=True)
 
-    # Robust tz-naive conversion
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    if df['date'].dt.tz is not None:
-        df['date'] = df['date'].dt.tz_convert(None)
-
+    # Ensure consistent timezone handling - convert to tz-naive
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        if hasattr(df['date'].dt, 'tz') and df['date'].dt.tz is not None:
+            df['date'] = df['date'].dt.tz_localize(None)
+    
     # Compute rolling volatility
     df['rvol'] = df['close'].pct_change().rolling(rvol_window).std() * np.sqrt(rvol_window)
     return ticker, df
@@ -78,22 +82,25 @@ def pip_distribution_tree(data: dict):
     tree = {}
     for tkr, df in data.items():
         cat, sub = _category_for_ticker(tkr)
-        if cat is None:
+        if cat is None or df.empty:
             continue
+        
         asset_name = TICKER_TO_NAME[tkr]
-
-        df["month_num"] = pd.to_datetime(df["date"], errors='coerce')
-        if df["month_num"].dt.tz is not None:
-            df["month_num"] = df["month_num"].dt.tz_convert(None)
-        df["month_num"] = df["month_num"].dt.month
-
-        df["phase"] = df["month_num"].map(lambda m: ProfitableSeasonalMap[cat][sub][m])
-
-        pip_dist = df.groupby("phase")["close"].agg(["min", "max", "mean"]).to_dict()
-        tree[asset_name] = pip_dist
+        
+        # Create a copy to avoid modifying the original dataframe
+        temp_df = df.copy()
+        
+        # Extract month number from the date
+        if 'date' in temp_df.columns:
+            # Ensure dates are tz-naive
+            temp_df["month_num"] = pd.to_datetime(temp_df["date"]).dt.month
+            temp_df["phase"] = temp_df["month_num"].map(lambda m: ProfitableSeasonalMap[cat][sub][m])
+            
+            pip_dist = temp_df.groupby("phase")["close"].agg(["min", "max", "mean"]).to_dict()
+            tree[asset_name] = pip_dist
+    
     return tree
 
-# ────────── Chunk 2 ──────────
 
 # --- Fetch & process data ---
 with st.spinner("Crunching the numbers…"):
