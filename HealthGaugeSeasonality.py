@@ -1,4 +1,4 @@
-# app.py
+# HealthGaugeSeasonality.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -85,7 +85,7 @@ ProfitableSeasonalMap = {
 }
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 2. BACK-END HELPERS (with improved logic)
+# 2. BACK-END HELPERS
 # ────────────────────────────────────────────────────────────────────────────────
 def fetch_price_data(symbol: str, start: str, end: str) -> pd.DataFrame:
     t = Ticker(symbol)
@@ -140,41 +140,29 @@ def fetch_cot_data(ticker: str, start_date: str = START_DATE, end_date: str = EN
 
 
 
-
-
 def calculate_health_gauge(df: pd.DataFrame,
                            ticker: str,
                            weights: Dict[str, float] = None) -> pd.DataFrame:
     if weights is None:
         weights = {"rvol": 0.5, "cot_long": 0.3, "cot_short": 0.2}
     
-    # Fetch COT data for the ticker
+    # Fetch COT data using the ticker's COT market name
     cot_df = fetch_cot_data(ticker)
     if cot_df.empty:
-        # If no COT data, fill with neutral defaults
-        df["long_positions"] = 1.0
-        df["short_positions"] = 1.0
+        df["long_positions"] = 3000
+        df["short_positions"] = 3000
     else:
-        # Align by date
-        df = df.copy()
-        df["date"] = pd.to_datetime(df["date"])
-        cot_df = cot_df.rename(columns={"report_date_as_yyyy_mm_dd": "date"})
-        merged = pd.merge_asof(
-            df.sort_values("date"),
-            cot_df.sort_values("date"),
-            on="date",
-            direction="backward"
-        )
-        df["long_positions"] = merged["non_commercial_long_all"].fillna(0)
-        df["short_positions"] = merged["non_commercial_short_all"].fillna(0)
-
+        data_length = len(df)
+        df["long_positions"] = cot_df["commercial_long_all"].values[:data_length]
+        df["short_positions"] = cot_df["commercial_short_all"].values[:data_length]
+    
     denom = df["long_positions"] + df["short_positions"]
-    df["cot_long_norm"]  = df["long_positions"] / denom.replace(0, np.nan)
-    df["cot_short_norm"] = df["short_positions"] / denom.replace(0, np.nan)
-
+    df["cot_long_norm"]  = df["long_positions"] / denom
+    df["cot_short_norm"] = df["short_positions"] / denom
+    
     df["health_gauge"] = (weights["rvol"] * df["rvol"].fillna(1) +
-                          weights["cot_long"] * df["cot_long_norm"].fillna(0) -
-                          weights["cot_short"] * df["cot_short_norm"].fillna(0))
+                          weights["cot_long"] * df["cot_long_norm"] -
+                          weights["cot_short"] * df["cot_short_norm"])
     return df
 
 def _all_tickers(asset_dict: Dict[str, Any]) -> List[str]:
@@ -182,12 +170,12 @@ def _all_tickers(asset_dict: Dict[str, Any]) -> List[str]:
     for v in asset_dict.values():
         if isinstance(v, list):
             tickers.extend(v)
-        else:  # nested dict
+        else:
             for lst in v.values():
                 tickers.extend(lst)
     return tickers
 
-@st.cache_data(show_spinner=False, ttl=3600)  # Cache for 1 hour
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_all_asset_data(asset_dict: Dict[str, Any],
                          start: str,
                          end: str,
@@ -209,9 +197,6 @@ def fetch_all_asset_data(asset_dict: Dict[str, Any],
             prog.progress((i + 1) / len(futures))
     return results
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 3.  DAILY-PIP-RANGE DISTRIBUTION by SEASONAL PHASE
-# ────────────────────────────────────────────────────────────────────────────────
 def _category_for_ticker(ticker: str):
     for cat, items in ASSET_LEADERS.items():
         if isinstance(items, list):
@@ -235,14 +220,26 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                            ProfitableSeasonalMap[cat][asset_name])
 
         df = df.copy()
-        df["month_num"] = pd.to_datetime(df["date"]).dt.month
+        # --- Fixed date handling ---
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df["month_num"] = df["date"].dt.month
+        elif "report_date_as_yyyy_mm_dd" in df.columns:
+            df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
+            df["month_num"] = df["report_date_as_yyyy_mm_dd"].dt.month
+        else:
+            raise ValueError(f"No valid date column found for {tkr}")
+
+        # compute daily pip move (abs pct-change *10,000)
         df["pip"] = df["close"].pct_change().abs() * 10_000
 
+        # bucket by phase color
         buckets: Dict[str, List[float]] = {"Green": [], "Yellow": [], "Red": []}
         for _, row in df.dropna(subset=["pip"]).iterrows():
             color = seasonal_colors[MONTH_MAP[row["month_num"]]]
             buckets[color].append(row["pip"])
 
+        # stats for each phase
         stats = {}
         for phase, vals in buckets.items():
             if vals:
@@ -256,18 +253,19 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                     "max":    float(arr.max()),
                 }
 
+        # write into tree
         if cat not in tree:
             tree[cat] = {}
         tree[cat][asset_name] = stats
     return tree
 
-@st.cache_data(show_spinner=False, ttl=3600)  # Cache for 1 hour
+@st.cache_data(show_spinner=False, ttl=3600)
 def build_tree(rvol_window: int = 20) -> Dict[str, Any]:
     data = fetch_all_asset_data(ASSET_LEADERS, START_DATE, END_DATE, rvol_window)
     return pip_distribution_tree(data)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 4.  STREAMLIT FRONT-END
+# STREAMLIT FRONT-END
 # ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="10-Year Market Research", layout="wide")
 
@@ -278,13 +276,14 @@ st.markdown(
     computes a *Health Gauge* and the **daily pip-range distribution** for each
     seasonal "phase" (Green / Yellow / Red).  
     Select the category on the left to inspect the JSON tree.
-    """)
+    """
+)
 
+# Sidebar
 category_selected = st.sidebar.selectbox(
     "Choose Asset Category",
     ["All"] + list(ASSET_LEADERS.keys())
 )
-
 rvol_window = st.sidebar.slider(
     "RVol Rolling Window (days)",
     min_value=5,
@@ -321,6 +320,7 @@ if st.checkbox("Show quick visual for selected category"):
         for asset, phases in assets.items():
             fig, ax = plt.subplots(figsize=(10, 6))
             phase_colors, mean_vals, median_vals = [], [], []
+
             for phase in ["Green", "Yellow", "Red"]:
                 if phase in phases:
                     phase_colors.append(phase)
@@ -329,10 +329,8 @@ if st.checkbox("Show quick visual for selected category"):
 
             x = np.arange(len(phase_colors))
             width = 0.35
-            ax.bar(x - width/2, mean_vals, width, color=[c.lower() for c in phase_colors],
-                   alpha=0.7, label='Mean')
-            ax.bar(x + width/2, median_vals, width, color=[c.lower() for c in phase_colors],
-                   alpha=0.4, hatch='///', label='Median')
+            ax.bar(x - width/2, mean_vals, width, color=[c.lower() for c in phase_colors], alpha=0.7, label='Mean')
+            ax.bar(x + width/2, median_vals, width, color=[c.lower() for c in phase_colors], alpha=0.4, hatch='///', label='Median')
 
             for i, v in enumerate(mean_vals):
                 ax.text(i - width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
