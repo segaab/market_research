@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 from yahooquery import Ticker
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from sodapy import Socrata
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 1. CONSTANTS
@@ -53,7 +54,6 @@ MONTH_MAP = {
 }
 
 # ============================== ProfitableSeasonalMap ==========================
-# Color code: "Green" = Positive, "Yellow" = Neutral, "Red" = Negative
 ProfitableSeasonalMap = {
     "Indices": {
         "S&P500": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Green",
@@ -99,31 +99,48 @@ def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     df["rvol"] = df["volume"] / df["volume"].rolling(window).mean()
     return df
 
-def fetch_cot_data(ticker: str) -> Dict[str, np.ndarray]:
+# --- Initialize Socrata client ---
+client = Socrata("publicreporting.cftc.gov", None)  # replace None with token if needed
+
+def fetch_cot_data(ticker: str, start_date: str = START_DATE, end_date: str = END_DATE) -> pd.DataFrame:
     """
-    Mock function to fetch COT data using the COT market names.
-    In a real implementation, you would use the COT_MARKET_NAMES to fetch actual COT data.
+    Fetch COT data for a given ticker using its mapped market_and_exchange_names.
     """
-    # Get the corresponding COT market name
-    market_name = COT_MARKET_NAMES.get(ticker)
-    
-    # For demonstration purposes, create random data
-    # In a real implementation, you would fetch actual COT data using the market_name
-    data_length = 365 * 10  # 10 years of daily data
-    
-    if market_name:
-        # Use the market name to fetch COT data
-        long_positions = np.random.randint(1_000, 5_000, data_length)
-        short_positions = np.random.randint(1_000, 5_000, data_length)
-    else:
-        # If no COT data available, use default values
-        long_positions = np.ones(data_length) * 3_000
-        short_positions = np.ones(data_length) * 3_000
-    
-    return {
-        "long_positions": long_positions,
-        "short_positions": short_positions
-    }
+    cot_name = COT_MARKET_NAMES.get(ticker)
+    if not cot_name:
+        return pd.DataFrame()
+
+    query = (
+        f"market_and_exchange_names='{cot_name}' "
+        f"AND report_date_as_yyyy_mm_dd >= '{start_date}' "
+        f"AND report_date_as_yyyy_mm_dd <= '{end_date}'"
+    )
+    results = client.get("6dca-aqww", where=query, limit=5000)
+    if not results:
+        return pd.DataFrame()
+
+    df = pd.DataFrame.from_records(results)
+    keep_cols = [
+        "report_date_as_yyyy_mm_dd",
+        "market_and_exchange_names",
+        "open_interest_all",
+        "commercial_long_all",
+        "commercial_short_all",
+        "non_commercial_long_all",
+        "non_commercial_short_all",
+    ]
+    df = df[keep_cols]
+    for col in keep_cols[2:]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
+    df["non_commercial_net"] = df["non_commercial_long_all"] - df["non_commercial_short_all"]
+    df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
+    return df.sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
+
+
+
+
+
 
 def calculate_health_gauge(df: pd.DataFrame,
                            ticker: str,
@@ -131,21 +148,33 @@ def calculate_health_gauge(df: pd.DataFrame,
     if weights is None:
         weights = {"rvol": 0.5, "cot_long": 0.3, "cot_short": 0.2}
     
-    # Fetch COT data using the ticker's COT market name
-    cot_data = fetch_cot_data(ticker)
-    
-    # Use only the necessary amount of COT data (same length as df)
-    data_length = len(df)
-    df["long_positions"] = cot_data["long_positions"][:data_length]
-    df["short_positions"] = cot_data["short_positions"][:data_length]
-    
+    # Fetch COT data for the ticker
+    cot_df = fetch_cot_data(ticker)
+    if cot_df.empty:
+        # If no COT data, fill with neutral defaults
+        df["long_positions"] = 1.0
+        df["short_positions"] = 1.0
+    else:
+        # Align by date
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        cot_df = cot_df.rename(columns={"report_date_as_yyyy_mm_dd": "date"})
+        merged = pd.merge_asof(
+            df.sort_values("date"),
+            cot_df.sort_values("date"),
+            on="date",
+            direction="backward"
+        )
+        df["long_positions"] = merged["non_commercial_long_all"].fillna(0)
+        df["short_positions"] = merged["non_commercial_short_all"].fillna(0)
+
     denom = df["long_positions"] + df["short_positions"]
-    df["cot_long_norm"]  = df["long_positions"] / denom
-    df["cot_short_norm"] = df["short_positions"] / denom
-    
+    df["cot_long_norm"]  = df["long_positions"] / denom.replace(0, np.nan)
+    df["cot_short_norm"] = df["short_positions"] / denom.replace(0, np.nan)
+
     df["health_gauge"] = (weights["rvol"] * df["rvol"].fillna(1) +
-                          weights["cot_long"] * df["cot_long_norm"] -
-                          weights["cot_short"] * df["cot_short_norm"])
+                          weights["cot_long"] * df["cot_long_norm"].fillna(0) -
+                          weights["cot_short"] * df["cot_short_norm"].fillna(0))
     return df
 
 def _all_tickers(asset_dict: Dict[str, Any]) -> List[str]:
@@ -205,18 +234,15 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                            if sub else
                            ProfitableSeasonalMap[cat][asset_name])
 
-        # compute daily pip move (abs pct-change *10,000)
         df = df.copy()
         df["month_num"] = pd.to_datetime(df["date"]).dt.month
         df["pip"] = df["close"].pct_change().abs() * 10_000
 
-        # bucket by phase color
         buckets: Dict[str, List[float]] = {"Green": [], "Yellow": [], "Red": []}
         for _, row in df.dropna(subset=["pip"]).iterrows():
             color = seasonal_colors[MONTH_MAP[row["month_num"]]]
             buckets[color].append(row["pip"])
 
-        # stats for each phase
         stats = {}
         for phase, vals in buckets.items():
             if vals:
@@ -230,7 +256,6 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                     "max":    float(arr.max()),
                 }
 
-        # write into tree
         if cat not in tree:
             tree[cat] = {}
         tree[cat][asset_name] = stats
@@ -255,13 +280,11 @@ st.markdown(
     Select the category on the left to inspect the JSON tree.
     """)
 
-# sidebar
 category_selected = st.sidebar.selectbox(
     "Choose Asset Category",
     ["All"] + list(ASSET_LEADERS.keys())
 )
 
-# Add RVol window adjustment slider
 rvol_window = st.sidebar.slider(
     "RVol Rolling Window (days)",
     min_value=5,
@@ -271,7 +294,6 @@ rvol_window = st.sidebar.slider(
     help="Number of days to use for the relative volume calculation"
 )
 
-# Add information about COT data
 st.sidebar.markdown("---")
 st.sidebar.markdown("### COT Data Sources")
 for ticker, market_name in COT_MARKET_NAMES.items():
@@ -283,69 +305,57 @@ for ticker, market_name in COT_MARKET_NAMES.items():
 with st.spinner("Crunching the numbers…"):
     dist_tree = build_tree(rvol_window)
 
-# Display JSON with improved formatting
 if category_selected == "All":
-st.subheader("Complete distribution tree")
-st.json(dist_tree)
+    st.subheader("Complete distribution tree")
+    st.json(dist_tree)
 else:
-st.subheader(f"{category_selected} distribution tree")
-st.json({category_selected: dist_tree.get(category_selected, {})})
+    st.subheader(f"{category_selected} distribution tree")
+    st.json({category_selected: dist_tree.get(category_selected, {})})
 
-# optional: quick bar-chart visual (toggle with improved visualization)
 if st.checkbox("Show quick visual for selected category"):
-cat_tree = dist_tree if category_selected == "All" else {category_selected: dist_tree.get(category_selected, {})}
+    cat_tree = dist_tree if category_selected == "All" else {category_selected: dist_tree.get(category_selected, {})}
+    col1, col2 = st.columns(2)
 
-col1, col2 = st.columns(2)
+    for cat, assets in cat_tree.items():
+        col1.markdown(f"### {cat}")
+        for asset, phases in assets.items():
+            fig, ax = plt.subplots(figsize=(10, 6))
+            phase_colors, mean_vals, median_vals = [], [], []
+            for phase in ["Green", "Yellow", "Red"]:
+                if phase in phases:
+                    phase_colors.append(phase)
+                    mean_vals.append(phases[phase]["mean"])
+                    median_vals.append(phases[phase]["median"])
 
-for cat, assets in cat_tree.items():
-col1.markdown(f"### {cat}")
+            x = np.arange(len(phase_colors))
+            width = 0.35
+            ax.bar(x - width/2, mean_vals, width, color=[c.lower() for c in phase_colors],
+                   alpha=0.7, label='Mean')
+            ax.bar(x + width/2, median_vals, width, color=[c.lower() for c in phase_colors],
+                   alpha=0.4, hatch='///', label='Median')
 
-for asset, phases in assets.items():
-fig, ax = plt.subplots(figsize=(10, 6))
+            for i, v in enumerate(mean_vals):
+                ax.text(i - width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
+            for i, v in enumerate(median_vals):
+                ax.text(i + width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
 
-# Extract data for plotting
-phase_colors = []
-mean_vals = []
-median_vals = []
+            ax.set_title(f"{asset} -- Daily Pip Range by Phase")
+            ax.set_ylabel("Pips (10,000× abs pct change)")
+            ax.set_xticks(x)
+            ax.set_xticklabels(phase_colors)
+            ax.legend()
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
 
-for phase in ["Green", "Yellow", "Red"]:
-if phase in phases:
-phase_colors.append(phase)
-mean_vals.append(phases[phase]["mean"])
-median_vals.append(phases[phase]["median"])
+            col1.pyplot(fig)
 
-# Plot bars for mean values
-x = np.arange(len(phase_colors))
-width = 0.35
-
-ax.bar(x - width/2, mean_vals, width, color=[c.lower() for c in phase_colors], alpha=0.7, label='Mean')
-ax.bar(x + width/2, median_vals, width, color=[c.lower() for c in phase_colors], alpha=0.4, hatch='///', label='Median')
-
-# Add data labels
-for i, v in enumerate(mean_vals):
-ax.text(i - width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
-for i, v in enumerate(median_vals):
-ax.text(i + width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
-
-ax.set_title(f"{asset} -- Daily Pip Range by Phase")
-ax.set_ylabel("Pips (10,000× abs pct change)")
-ax.set_xticks(x)
-ax.set_xticklabels(phase_colors)
-ax.legend()
-ax.grid(axis='y', linestyle='--', alpha=0.7)
-
-col1.pyplot(fig)
-
-# Display additional stats in a table
-stats_df = pd.DataFrame({
-"Phase": phase_colors,
-"Count": [phases[p]["count"] for p in phase_colors],
-"Mean": [f"{phases[p]['mean']:.2f}" for p in phase_colors],
-"Median": [f"{phases[p]['median']:.2f}" for p in phase_colors],
-"Min": [f"{phases[p]['min']:.2f}" for p in phase_colors],
-"Max": [f"{phases[p]['max']:.2f}" for p in phase_colors],
-"StdDev": [f"{phases[p]['std']:.2f}" for p in phase_colors],
-})
-
-col2.markdown(f"### {asset} Statistics")
-col2.dataframe(stats_df, use_container_width=True)
+            stats_df = pd.DataFrame({
+                "Phase": phase_colors,
+                "Count": [phases[p]["count"] for p in phase_colors],
+                "Mean": [f"{phases[p]['mean']:.2f}" for p in phase_colors],
+                "Median": [f"{phases[p]['median']:.2f}" for p in phase_colors],
+                "Min": [f"{phases[p]['min']:.2f}" for p in phase_colors],
+                "Max": [f"{phases[p]['max']:.2f}" for p in phase_colors],
+                "StdDev": [f"{phases[p]['std']:.2f}" for p in phase_colors],
+            })
+            col2.markdown(f"### {asset} Statistics")
+            col2.dataframe(stats_df, use_container_width=True)
