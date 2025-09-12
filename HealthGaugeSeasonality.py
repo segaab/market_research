@@ -1,4 +1,4 @@
-# app.py
+# app.py - Chunk 1
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,9 +6,10 @@ import datetime
 import concurrent.futures
 from typing import Dict, Any, List
 from yahooquery import Ticker
-from tqdm import tqdm
-import matplotlib.pyplot as plt
 from sodapy import Socrata
+import matplotlib.pyplot as plt
+import plotly.express as px
+import json
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 1. CONSTANTS
@@ -18,11 +19,11 @@ END_DATE   = datetime.datetime.now().strftime("%Y-%m-%d")
 
 ASSET_LEADERS = {
     "Indices": ["^GSPC", "^GDAXI"],
-    "Forex":   ["EURUSD=X", "USDJPY=X"],
+    "Forex": ["EURUSD=X", "USDJPY=X"],
     "Commodities": {
         "Agricultural": ["ZS=F"],
-        "Energy":       ["CL=F"],
-        "Metals":       ["GC=F"]
+        "Energy": ["CL=F"],
+        "Metals": ["GC=F"]
     }
 }
 
@@ -97,38 +98,53 @@ def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     df["rvol"] = df["volume"] / df["volume"].rolling(window).mean()
     return df
 
-# --- Initialize Socrata client for real COT fetching ---
-client = Socrata("publicreporting.cftc.gov", None)  # token can be added
+# --- COT Fetching function (integrated) ---
+from sodapy import Socrata
 
-def fetch_cot_data(ticker: str) -> Dict[str, np.ndarray]:
-    """
-    Fetch COT data using COT_MARKET_NAMES mapping.
-    """
+client = Socrata("publicreporting.cftc.gov", None)
+
+def fetch_cot_data(ticker: str, start_date: str = START_DATE, end_date: str = END_DATE) -> pd.DataFrame:
     market_name = COT_MARKET_NAMES.get(ticker)
-    data_length = 365 * 10
-    if market_name:
-        long_positions = np.random.randint(1000, 5000, data_length)
-        short_positions = np.random.randint(1000, 5000, data_length)
-    else:
-        long_positions = np.ones(data_length) * 3000
-        short_positions = np.ones(data_length) * 3000
-    return {"long_positions": long_positions, "short_positions": short_positions}
+    if not market_name:
+        return pd.DataFrame()  # no COT data
+    
+    query = (f"market_and_exchange_names='{market_name}' "
+             f"AND report_date_as_yyyy_mm_dd >= '{start_date}' "
+             f"AND report_date_as_yyyy_mm_dd <= '{end_date}'")
+    results = client.get("6dca-aqww", where=query, limit=5000)
+    if not results:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame.from_records(results)
+    keep_cols = ["report_date_as_yyyy_mm_dd", "market_and_exchange_names",
+                 "open_interest_all", "commercial_long_all", "commercial_short_all",
+                 "non_commercial_long_all", "non_commercial_short_all"]
+    df = df[keep_cols]
+    for col in keep_cols[2:]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
+    df["non_commercial_net"] = df["non_commercial_long_all"] - df["non_commercial_short_all"]
+    df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
+    return df.sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
 
 def calculate_health_gauge(df: pd.DataFrame,
                            ticker: str,
                            weights: Dict[str, float] = None) -> pd.DataFrame:
     if weights is None:
         weights = {"rvol": 0.5, "cot_long": 0.3, "cot_short": 0.2}
-    cot_data = fetch_cot_data(ticker)
-    data_length = len(df)
-    df["long_positions"] = cot_data["long_positions"][:data_length]
-    df["short_positions"] = cot_data["short_positions"][:data_length]
-    denom = df["long_positions"] + df["short_positions"]
-    df["cot_long_norm"] = df["long_positions"] / denom
-    df["cot_short_norm"] = df["short_positions"] / denom
-    df["health_gauge"] = (weights["rvol"] * df["rvol"].fillna(1) +
-                          weights["cot_long"] * df["cot_long_norm"] -
-                          weights["cot_short"] * df["cot_short_norm"])
+    
+    cot_df = fetch_cot_data(ticker)
+    if not cot_df.empty:
+        df = df.copy()
+        df = df.iloc[-len(cot_df):]  # align lengths
+        denom = cot_df["commercial_long_all"] + cot_df["commercial_short_all"]
+        df["cot_long_norm"] = cot_df["commercial_long_all"] / denom
+        df["cot_short_norm"] = cot_df["commercial_short_all"] / denom
+        df["health_gauge"] = (weights["rvol"] * df["rvol"].fillna(1) +
+                              weights["cot_long"] * df["cot_long_norm"] -
+                              weights["cot_short"] * df["cot_short_norm"])
+    else:
+        df["health_gauge"] = df["rvol"].fillna(1)
     return df
 
 def _all_tickers(asset_dict: Dict[str, Any]) -> List[str]:
@@ -163,7 +179,19 @@ def fetch_all_asset_data(asset_dict: Dict[str, Any],
             prog.progress((i + 1) / len(futures))
     return results
 
-# =================== FIXED pip_distribution_tree FUNCTION ========================
+
+
+# app.py - Chunk 2
+# ────────────────────────────────────────────────────────────────────────────────
+# 3. HELPER FUNCTIONS
+# ────────────────────────────────────────────────────────────────────────────────
+def _category_for_ticker(tkr: str):
+    for cat, subdict in ProfitableSeasonalMap.items():
+        for sub, months in subdict.items():
+            if TICKER_TO_NAME.get(tkr) == sub:
+                return cat, sub
+    return None, None
+
 def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
     tree: Dict[str, Any] = {}
     for tkr, df in data.items():
@@ -171,116 +199,57 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         if cat is None:
             continue
         asset_name = TICKER_TO_NAME[tkr]
-        seasonal_colors = ProfitableSeasonalMap.get(cat, {}).get(sub or asset_name, {})
-
-        if df.empty or df.shape[0] < 2:
-            continue
-
-        df = df.copy()
-        df["month_num"] = pd.to_datetime(df["date"], errors="coerce").dt.month
-        df = df.dropna(subset=["month_num"])
-        df["month_num"] = df["month_num"].astype(int)
-
-        # Ensure 'close' is numeric
-        if "close" in df.columns:
-            close_series = pd.to_numeric(df["close"], errors="coerce")
-            df["pip"] = close_series.pct_change().abs() * 10_000
-        else:
-            df["pip"] = np.nan
-        df = df.dropna(subset=["pip"])
-
-        buckets: Dict[str, List[float]] = {"Green": [], "Yellow": [], "Red": []}
-        for _, row in df.iterrows():
-            month_str = MONTH_MAP.get(row["month_num"])
-            color = seasonal_colors.get(month_str)
-            if color:
-                buckets[color].append(row["pip"])
-
-        stats = {}
-        for phase, vals in buckets.items():
-            if vals:
-                arr = np.array(vals)
-                stats[phase] = {
-                    "count":  int(arr.size),
-                    "mean":   float(arr.mean()),
-                    "median": float(np.median(arr)),
-                    "std":    float(arr.std(ddof=0)),
-                    "min":    float(arr.min()),
-                    "max":    float(arr.max()),
-                }
-
+        df["month_num"] = pd.to_datetime(df["date"]).dt.month
+        df["phase"] = df["month_num"].map(lambda m: ProfitableSeasonalMap[cat][sub].get(MONTH_MAP[m], "Yellow"))
+        # Group by phase and calculate pip ranges
+        pip_dist = df.groupby("phase")["close"].agg(["min", "max", "mean"]).to_dict(orient="index")
         if cat not in tree:
             tree[cat] = {}
-        tree[cat][asset_name] = stats
+        tree[cat][asset_name] = pip_dist
     return tree
 
+def display_distribution(df: pd.DataFrame, ticker: str):
+    df["month_num"] = pd.to_datetime(df["date"]).dt.month
+    df["phase"] = df["month_num"].map(lambda m: ProfitableSeasonalMap[_category_for_ticker(ticker)[0]][_category_for_ticker(ticker)[1]].get(MONTH_MAP[m], "Yellow"))
+    fig = px.box(df, x="phase", y="close", color="phase", title=f"Price Distribution by Seasonal Phase ({ticker})",
+                 color_discrete_map={"Green":"green", "Yellow":"gold", "Red":"red"})
+    st.plotly_chart(fig, use_container_width=True)
 
-
-# =================== STREAMLIT DASHBOARD ========================
-st.set_page_config(page_title="Market Research Dashboard", layout="wide")
-
+# ────────────────────────────────────────────────────────────────────────────────
+# 4. STREAMLIT LAYOUT
+# ────────────────────────────────────────────────────────────────────────────────
 st.title("📊 Market Research Dashboard")
 
-# --- Sidebar Controls ---
-category_selected = st.sidebar.selectbox(
-    "Choose Asset Category",
-    ["All", "Indices", "Forex", "Commodities"]
-)
+category_selected = st.sidebar.selectbox("Choose Asset Category", ["Indices", "Forex", "Commodities", "All"])
+rvol_window = st.sidebar.number_input("RVol Rolling Window (days)", min_value=5, max_value=100, value=20)
 
-rvol_window = st.sidebar.number_input(
-    "RVol Rolling Window (days)", min_value=5, max_value=100, value=20
-)
-
-st.sidebar.markdown("### COT Data Sources")
-for tkr, desc in COT_MARKET_NAMES.items():
-    st.sidebar.markdown(f"{TICKER_TO_NAME[tkr]}: {desc}")
-
-# --- Fetch & Process Data ---
+# Fetch & process data
 with st.spinner("Crunching the numbers…"):
     data = fetch_all_asset_data(ASSET_LEADERS, START_DATE, END_DATE, rvol_window)
     dist_tree = pip_distribution_tree(data)
 
-# --- Helper: Map ticker to category/subcategory ---
-def _category_for_ticker(tkr: str):
-    for cat, assets in ASSET_LEADERS.items():
-        if isinstance(assets, list):
-            if tkr in assets:
-                return cat, None
-        elif isinstance(assets, dict):
-            for sub, lst in assets.items():
-                if tkr in lst:
-                    return cat, sub
-    return None, None
+# Display distribution for each ticker
+if category_selected != "All":
+    tickers_to_show = [t for t in data.keys() if _category_for_ticker(t)[0] == category_selected]
+else:
+    tickers_to_show = list(data.keys())
 
-# --- Display JSON tree for inspection ---
-def display_tree(tree: Dict[str, Any], filter_cat: str = "All"):
-    for cat, assets in tree.items():
-        if filter_cat != "All" and cat != filter_cat:
-            continue
-        st.subheader(cat)
-        for asset, stats in assets.items():
-            st.markdown(f"**{asset}**")
-            st.json(stats)
+for tkr in tickers_to_show:
+    st.subheader(TICKER_TO_NAME[tkr])
+    df = data[tkr]
+    st.dataframe(df.tail(5))
+    display_distribution(df, tkr)
 
-display_tree(dist_tree, filter_cat=category_selected)
+# Display JSON tree
+st.subheader("📁 Pip Distribution Tree")
+st.json(dist_tree)
 
-# --- Optional: Plot pip distributions ---
-def plot_pip_distribution(data: Dict[str, pd.DataFrame], ticker: str):
-    if ticker not in data:
-        st.warning(f"No data for {ticker}")
-        return
-    df = data[ticker]
-    if df.empty or "pip" not in df.columns:
-        st.warning(f"No pip data for {ticker}")
-        return
-    plt.figure(figsize=(10, 4))
-    plt.hist(df["pip"].dropna(), bins=50, color="skyblue", edgecolor="black")
-    plt.title(f"{TICKER_TO_NAME.get(ticker, ticker)} - Pip Distribution")
-    plt.xlabel("Pips")
-    plt.ylabel("Frequency")
-    st.pyplot(plt.gcf())
-
-st.markdown("---")
-st.subheader("Visualize Pip Distribution")
-ticker_to_plot = st.selectbox("Select Asset", _all_tickers(ASSET_LEADERS))
-plot_pip_distribution(data, ticker_to_plot)
+# Download JSON tree
+json_str = json.dumps(dist_tree, indent=2)
+filename = f"pip_distribution_{category_selected.lower()}.json"
+st.download_button(
+    label="Download JSON",
+    data=json_str,
+    file_name=filename,
+    mime="application/json"
+)
