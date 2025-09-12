@@ -6,9 +6,6 @@ from yahooquery import Ticker
 import concurrent.futures
 from datetime import datetime
 import plotly.express as px
-import json
-
-
 
 # --- Asset definitions ---
 ASSET_LEADERS = {
@@ -100,6 +97,8 @@ def pip_distribution_tree(data: dict):
             tree[asset_name] = pip_dist
     
     return tree
+
+
 
 
 # --- Fetch & process data ---
