@@ -1,134 +1,80 @@
-# === app.py ===
-import streamlit as st
+# ────────── Chunk 1 ──────────
 import pandas as pd
 import numpy as np
-import datetime
-import concurrent.futures
-from typing import Dict, Any, List
-from yahooquery import Ticker
-import matplotlib.pyplot as plt
-import plotly.express as px
+import streamlit as st
 import json
+from yahooquery import Ticker
+import concurrent.futures
+from datetime import datetime
+import plotly.express as px
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 1. CONSTANTS
-# ────────────────────────────────────────────────────────────────────────────────
-START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365 * 10)).strftime("%Y-%m-%d")
-END_DATE   = datetime.datetime.now().strftime("%Y-%m-%d")
-
+# --- Asset definitions ---
 ASSET_LEADERS = {
-    "Indices": ["^GSPC", "^GDAXI"],              # S&P 500, DAX
-    "Forex":   ["EURUSD=X", "USDJPY=X"],          # EUR/USD, USD/JPY
-    "Commodities": {
-        "Agricultural": ["ZS=F"],                 # Soybeans
-        "Energy":       ["CL=F"],                 # Crude
-        "Metals":       ["GC=F"]                  # Gold
-    }
-}
-
-COT_MARKET_NAMES = {
-    "^GSPC": "S&P 500 Consolidated -- Chicago Mercantile Exchange",
-    "EURUSD=X": "EURO FX -- Chicago Mercantile Exchange",
-    "USDJPY=X": "JAPANESE YEN -- Chicago Mercantile Exchange",
-    "ZS=F": "SOYBEANS -- Chicago Board of Trade",
-    "CL=F": "WTI-PHYSICAL -- New York Mercantile Exchange",
-    "GC=F": "GOLD -- Commodity Exchange Inc."
+    "Indices": ["^GSPC"],
+    "Forex": ["EURUSD=X", "JPY=X"],
+    "Agricultural": ["ZS=F"],
+    "Energy": ["CL=F"],
+    "Metals": ["GC=F"]
 }
 
 TICKER_TO_NAME = {
-    "^GSPC": "S&P500",
-    "^GDAXI": "DAX",
+    "^GSPC": "S&P 500",
     "EURUSD=X": "EUR/USD",
-    "USDJPY=X": "USD/JPY",
-    "ZS=F": "Agricultural",
-    "CL=F": "Energy",
-    "GC=F": "Metals",
+    "JPY=X": "USD/JPY",
+    "ZS=F": "Soybeans",
+    "CL=F": "WTI Crude",
+    "GC=F": "Gold"
 }
 
-MONTH_MAP = {
-    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr",
-    5: "May", 6: "Jun", 7: "Jul", 8: "Aug",
-    9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
-}
-
-# ============================== ProfitableSeasonalMap ==========================
 ProfitableSeasonalMap = {
-    "Indices": {
-        "S&P500": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Green",
-                   "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
-                   "Sep": "Red", "Oct": "Green", "Nov": "Green", "Dec": "Green"},
-        "DAX":    {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Green",
-                   "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
-                   "Sep": "Red", "Oct": "Green", "Nov": "Green", "Dec": "Green"},
-    },
-    "Forex": {
-        "EUR/USD": {"Jan": "Green", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
-                    "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
-                    "Sep": "Green", "Oct": "Yellow", "Nov": "Yellow", "Dec": "Yellow"},
-        "USD/JPY": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
-                    "May": "Yellow", "Jun": "Yellow", "Jul": "Green", "Aug": "Yellow",
-                    "Sep": "Yellow", "Oct": "Yellow", "Nov": "Yellow", "Dec": "Yellow"},
-    },
-    "Commodities": {
-        "Agricultural": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
-                         "May": "Yellow", "Jun": "Yellow", "Jul": "Green", "Aug": "Yellow",
-                         "Sep": "Yellow", "Oct": "Yellow", "Nov": "Yellow", "Dec": "Yellow"},
-        "Energy":       {"Jan": "Green", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
-                         "May": "Yellow", "Jun": "Green", "Jul": "Green", "Aug": "Green",
-                         "Sep": "Yellow", "Oct": "Yellow", "Nov": "Green", "Dec": "Green"},
-        "Metals":       {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
-                         "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
-                         "Sep": "Yellow", "Oct": "Green", "Nov": "Green", "Dec": "Green"},
-    },
+    "Indices": {"S&P 500": {m: "Green" for m in range(1, 13)}},
+    "Forex": {"EUR/USD": {m: "Yellow" for m in range(1, 13)}, "USD/JPY": {m: "Red" for m in range(1, 13)}},
+    "Agricultural": {"Soybeans": {m: "Green" for m in range(1, 13)}},
+    "Energy": {"WTI Crude": {m: "Yellow" for m in range(1, 13)}},
+    "Metals": {"Gold": {m: "Red" for m in range(1, 13)}}
 }
 
+# --- Sidebar ---
+category_selected = st.sidebar.selectbox("Choose Asset Category", list(ASSET_LEADERS.keys()))
+rvol_window = st.sidebar.number_input("RVol Rolling Window (days)", min_value=5, max_value=60, value=20)
 
+START_DATE = "2013-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
 
+# --- Helper functions ---
+def fetch_single(ticker):
+    t = Ticker(ticker)
+    df = t.history(start=START_DATE, end=END_DATE)
+    if df.empty:
+        return ticker, pd.DataFrame()
+    df.reset_index(inplace=True)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 2. FUNCTIONS
-# ────────────────────────────────────────────────────────────────────────────────
+    # Robust tz-naive conversion
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    if df['date'].dt.tz is not None:
+        df['date'] = df['date'].dt.tz_convert(None)
 
-def _category_for_ticker(tkr: str):
-    """Return category and subcategory for a given ticker."""
-    for cat, subs in ASSET_LEADERS.items():
-        if isinstance(subs, dict):
-            for sub, tickers in subs.items():
-                if tkr in tickers:
-                    return cat, sub
-        else:
-            if tkr in subs:
-                return cat, tkr
-    return None, None
+    # Compute rolling volatility
+    df['rvol'] = df['close'].pct_change().rolling(rvol_window).std() * np.sqrt(rvol_window)
+    return ticker, df
 
-
-def fetch_all_asset_data(assets: Dict[str, Any], start: str, end: str, rvol_window: int):
-    """Fetch historical data for all tickers using yahooquery."""
+def fetch_all_asset_data(assets, start, end, rvol_window):
     data = {}
-
-    def fetch_single(ticker):
-        t = Ticker(ticker)
-        df = t.history(start=start, end=end)
-        if df.empty:
-            return ticker, pd.DataFrame()
-        df.reset_index(inplace=True)
-        # Ensure tz-naive datetime
-        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
-        # Compute rolling volatility
-        df['rvol'] = df['close'].pct_change().rolling(rvol_window).std() * np.sqrt(rvol_window)
-        return ticker, df
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(fetch_single, t) for cat in assets.values() for t in (cat if isinstance(cat, list) else [tk for sub in cat.values() for tk in sub])]
+        futures = [executor.submit(fetch_single, t) for cat in assets.values() for t in cat]
         for f in concurrent.futures.as_completed(futures):
             ticker, df = f.result()
             data[ticker] = df
-
     return data
 
+def _category_for_ticker(tkr: str):
+    for cat, tickers in ASSET_LEADERS.items():
+        if tkr in tickers:
+            sub = TICKER_TO_NAME.get(tkr, None)
+            return cat, sub
+    return None, None
 
-def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    """Compute pip distribution tree per asset based on seasonal map."""
+def pip_distribution_tree(data: dict):
     tree = {}
     for tkr, df in data.items():
         cat, sub = _category_for_ticker(tkr)
@@ -136,59 +82,57 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
             continue
         asset_name = TICKER_TO_NAME[tkr]
 
-        if df.empty:
-            continue
+        df["month_num"] = pd.to_datetime(df["date"], errors='coerce')
+        if df["month_num"].dt.tz is not None:
+            df["month_num"] = df["month_num"].dt.tz_convert(None)
+        df["month_num"] = df["month_num"].dt.month
 
-        # --- tz-naive datetime fix ---
-        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
-        df["month_num"] = df["date"].dt.month
-        df["phase"] = df["month_num"].map(lambda m: ProfitableSeasonalMap[cat][sub][MONTH_MAP[m]])
+        df["phase"] = df["month_num"].map(lambda m: ProfitableSeasonalMap[cat][sub][m])
 
-        # Group by phase
-        pip_dist = df.groupby("phase")["close"].agg(["min", "max", "mean"]).to_dict('index')
+        pip_dist = df.groupby("phase")["close"].agg(["min", "max", "mean"]).to_dict()
         tree[asset_name] = pip_dist
-
     return tree
 
+# ────────── Chunk 2 ──────────
 
-def plot_distribution(df: pd.DataFrame, ticker: str):
-    """Plot pip-range distribution using Plotly."""
-    df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
-    fig = px.line(df, x='date', y='close', title=f"{ticker} Price Distribution")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def download_json(tree: Dict[str, Any], category: str):
-    """Provide download link for JSON tree."""
-    filename = f"{category}_pip_distribution.json"
-    json_str = json.dumps(tree, indent=2)
-    st.download_button("Download JSON Tree", data=json_str, file_name=filename, mime="application/json")
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 3. STREAMLIT UI
-# ────────────────────────────────────────────────────────────────────────────────
-
-st.title("📊 Market Research Dashboard")
-
-category_selected = st.sidebar.selectbox("Choose Asset Category", list(ASSET_LEADERS.keys()))
-rvol_window = st.sidebar.number_input("RVol Rolling Window (days)", min_value=1, max_value=100, value=20)
-
+# --- Fetch & process data ---
 with st.spinner("Crunching the numbers…"):
     data = fetch_all_asset_data(ASSET_LEADERS, START_DATE, END_DATE, rvol_window)
     dist_tree = pip_distribution_tree(data)
 
 # --- Display each asset distribution ---
 if category_selected != "All":
-    for tkr in (ASSET_LEADERS[category_selected] if isinstance(ASSET_LEADERS[category_selected], list)
-                else [tk for sub in ASSET_LEADERS[category_selected].values() for tk in sub]):
-        if tkr in data:
-            st.subheader(TICKER_TO_NAME[tkr])
-            plot_distribution(data[tkr], TICKER_TO_NAME[tkr])
+    tickers_to_show = ASSET_LEADERS[category_selected]
+else:
+    tickers_to_show = [t for sublist in ASSET_LEADERS.values() for t in sublist]
+
+for tkr in tickers_to_show:
+    df = data[tkr]
+    if df.empty:
+        st.warning(f"No data for {TICKER_TO_NAME[tkr]}")
+        continue
+
+    # Plot rolling volatility distribution
+    fig = px.line(df, x="date", y="rvol", title=f"{TICKER_TO_NAME[tkr]} Rolling Volatility")
+    fig.update_layout(
+        template="plotly_white",
+        title_font_size=18,
+        xaxis_title="Date",
+        yaxis_title="Rolling Volatility",
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # --- Display JSON tree ---
-st.subheader("Seasonal Pip Distribution Tree")
+st.subheader("Pip Range Distribution Tree")
 st.json(dist_tree)
 
 # --- Download JSON ---
-download_json(dist_tree, category_selected)
+json_filename = f"pip_distribution_{category_selected.replace(' ', '_')}.json"
+json_str = json.dumps(dist_tree, indent=4)
+st.download_button(
+    label="Download JSON Tree",
+    data=json_str,
+    file_name=json_filename,
+    mime="application/json"
+)
