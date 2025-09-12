@@ -1,4 +1,6 @@
-# app.py
+# ────────────────────────────────────────────────────────────────────────────────
+# 0. IMPORTS
+# ────────────────────────────────────────────────────────────────────────────────
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,11 +20,11 @@ END_DATE   = datetime.datetime.now().strftime("%Y-%m-%d")
 
 ASSET_LEADERS = {
     "Indices": ["^GSPC", "^GDAXI"],
-    "Forex": ["EURUSD=X", "USDJPY=X"],
+    "Forex":   ["EURUSD=X", "USDJPY=X"],
     "Commodities": {
         "Agricultural": ["ZS=F"],
-        "Energy": ["CL=F"],
-        "Metals": ["GC=F"]
+        "Energy":       ["CL=F"],
+        "Metals":       ["GC=F"]
     }
 }
 
@@ -51,18 +53,72 @@ MONTH_MAP = {
     9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
 }
 
-# COT client
+# Color-coded seasonal map
+ProfitableSeasonalMap = {
+    "Indices": {
+        "S&P500": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Green",
+                   "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
+                   "Sep": "Red", "Oct": "Green", "Nov": "Green", "Dec": "Green"},
+        "DAX":    {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Green",
+                   "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
+                   "Sep": "Red", "Oct": "Green", "Nov": "Green", "Dec": "Green"},
+    },
+    "Forex": {
+        "EUR/USD": {"Jan": "Green", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
+                    "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
+                    "Sep": "Green", "Oct": "Yellow", "Nov": "Yellow", "Dec": "Yellow"},
+        "USD/JPY": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
+                    "May": "Yellow", "Jun": "Yellow", "Jul": "Green", "Aug": "Yellow",
+                    "Sep": "Yellow", "Oct": "Yellow", "Nov": "Yellow", "Dec": "Yellow"},
+    },
+    "Commodities": {
+        "Agricultural": {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
+                         "May": "Yellow", "Jun": "Yellow", "Jul": "Green", "Aug": "Yellow",
+                         "Sep": "Yellow", "Oct": "Yellow", "Nov": "Yellow", "Dec": "Yellow"},
+        "Energy":       {"Jan": "Green", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
+                         "May": "Yellow", "Jun": "Green", "Jul": "Green", "Aug": "Green",
+                         "Sep": "Yellow", "Oct": "Yellow", "Nov": "Green", "Dec": "Green"},
+        "Metals":       {"Jan": "Yellow", "Feb": "Yellow", "Mar": "Yellow", "Apr": "Yellow",
+                         "May": "Yellow", "Jun": "Yellow", "Jul": "Yellow", "Aug": "Yellow",
+                         "Sep": "Yellow", "Oct": "Green", "Nov": "Green", "Dec": "Green"},
+    },
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 2. BACK-END HELPERS
+# ────────────────────────────────────────────────────────────────────────────────
+def fetch_price_data(symbol: str, start: str, end: str) -> pd.DataFrame:
+    t = Ticker(symbol)
+    df = t.history(start=start, end=end).reset_index()
+    if df.empty:
+        raise ValueError(f"No data for {symbol}")
+    df.rename(columns={"adjclose": "close"}, inplace=True)
+    return df[["symbol", "date", "close", "volume"]]
+
+def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    df["rvol"] = df["volume"] / df["volume"].rolling(window).mean()
+    return df
+
+# --- Initialize Socrata client ---
 client = Socrata("publicreporting.cftc.gov", None)
 
-def fetch_cot_data(cot_name: str, start_date: str = START_DATE, end_date: str = END_DATE) -> pd.DataFrame:
+def fetch_cot_data(ticker: str, start_date: str = START_DATE, end_date: str = END_DATE) -> pd.DataFrame:
+    """
+    Fetch real COT data for a ticker using the COT_MARKET_NAMES mapping.
+    """
+    market_name = COT_MARKET_NAMES.get(ticker)
+    if not market_name:
+        return pd.DataFrame()
+
     query = (
-        f"market_and_exchange_names='{cot_name}' "
+        f"market_and_exchange_names='{market_name}' "
         f"AND report_date_as_yyyy_mm_dd >= '{start_date}' "
         f"AND report_date_as_yyyy_mm_dd <= '{end_date}'"
     )
     results = client.get("6dca-aqww", where=query, limit=5000)
     if not results:
         return pd.DataFrame()
+
     df = pd.DataFrame.from_records(results)
     keep_cols = [
         "report_date_as_yyyy_mm_dd",
@@ -81,40 +137,25 @@ def fetch_cot_data(cot_name: str, start_date: str = START_DATE, end_date: str = 
     df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
     return df.sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 2. BACK-END HELPERS
-# ────────────────────────────────────────────────────────────────────────────────
-def fetch_price_data(symbol: str, start: str, end: str) -> pd.DataFrame:
-    t = Ticker(symbol)
-    df = t.history(start=start, end=end).reset_index()
-    if df.empty:
-        raise ValueError(f"No data for {symbol}")
-    df.rename(columns={"adjclose": "close"}, inplace=True)
-    return df[["symbol", "date", "close", "volume"]]
-
-def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    df["rvol"] = df["volume"] / df["volume"].rolling(window).mean()
-    return df
-
 def calculate_health_gauge(df: pd.DataFrame,
                            ticker: str,
                            weights: Dict[str, float] = None) -> pd.DataFrame:
     if weights is None:
         weights = {"rvol": 0.5, "cot_long": 0.3, "cot_short": 0.2}
     
-    market_name = COT_MARKET_NAMES.get(ticker)
-    cot_df = fetch_cot_data(market_name) if market_name else pd.DataFrame()
-    
-    if cot_df.empty:
-        df["long_positions"] = 3000
-        df["short_positions"] = 3000
+    cot_df = fetch_cot_data(ticker)
+    data_len = len(df)
+    if not cot_df.empty:
+        long_positions = cot_df["commercial_long_all"].values[:data_len]
+        short_positions = cot_df["commercial_short_all"].values[:data_len]
     else:
-        length = len(df)
-        df["long_positions"] = cot_df["commercial_long_all"].values[:length]
-        df["short_positions"] = cot_df["commercial_short_all"].values[:length]
-    
+        long_positions = np.ones(data_len) * 3000
+        short_positions = np.ones(data_len) * 3000
+
+    df["long_positions"] = long_positions
+    df["short_positions"] = short_positions
     denom = df["long_positions"] + df["short_positions"]
-    df["cot_long_norm"] = df["long_positions"] / denom
+    df["cot_long_norm"]  = df["long_positions"] / denom
     df["cot_short_norm"] = df["short_positions"] / denom
     df["health_gauge"] = (weights["rvol"] * df["rvol"].fillna(1) +
                           weights["cot_long"] * df["cot_long_norm"] -
@@ -154,6 +195,8 @@ def fetch_all_asset_data(asset_dict: Dict[str, Any],
     return results
 
 
+
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 3. DAILY-PIP-RANGE DISTRIBUTION by SEASONAL PHASE
 # ────────────────────────────────────────────────────────────────────────────────
@@ -175,21 +218,29 @@ def pip_distribution_tree(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         if cat is None:
             continue
         asset_name = TICKER_TO_NAME[tkr]
-        seasonal_colors = (ProfitableSeasonalMap[cat][sub]
-                           if sub else
-                           ProfitableSeasonalMap[cat][asset_name])
+
+        # Safely get seasonal colors
+        if sub:
+            seasonal_colors = ProfitableSeasonalMap.get(cat, {}).get(sub, {})
+        else:
+            seasonal_colors = ProfitableSeasonalMap.get(cat, {}).get(asset_name, {})
+
+        if df.empty or df.shape[0] < 2:
+            continue
 
         df = df.copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date", "close"])
-        df["month_num"] = df["date"].dt.month
+        df["month_num"] = pd.to_datetime(df["date"], errors="coerce").dt.month
+        df = df.dropna(subset=["month_num"])
+        df["month_num"] = df["month_num"].astype(int)
         df["pip"] = df["close"].pct_change().abs() * 10_000
 
+        # bucket by phase color
         buckets: Dict[str, List[float]] = {"Green": [], "Yellow": [], "Red": []}
-        for _, row in df.dropna(subset=["pip", "month_num"]).iterrows():
-            month_num = int(row["month_num"])
-            color = seasonal_colors[MONTH_MAP[month_num]]
-            buckets[color].append(row["pip"])
+        for _, row in df.dropna(subset=["pip"]).iterrows():
+            month_str = MONTH_MAP.get(row["month_num"], None)
+            color = seasonal_colors.get(month_str, None)
+            if color:
+                buckets[color].append(row["pip"])
 
         stats = {}
         for phase, vals in buckets.items():
@@ -228,6 +279,7 @@ st.markdown(
     """
 )
 
+# Sidebar controls
 category_selected = st.sidebar.selectbox(
     "Choose Asset Category",
     ["All"] + list(ASSET_LEADERS.keys())
@@ -238,21 +290,18 @@ rvol_window = st.sidebar.slider(
     min_value=5,
     max_value=60,
     value=20,
-    step=1,
-    help="Number of days to use for the relative volume calculation"
+    step=1
 )
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### COT Data Sources")
 for ticker, market_name in COT_MARKET_NAMES.items():
-    if market_name:
-        st.sidebar.markdown(f"**{TICKER_TO_NAME[ticker]}**: {market_name}")
-    else:
-        st.sidebar.markdown(f"**{TICKER_TO_NAME[ticker]}**: No COT data available")
+    st.sidebar.markdown(f"**{TICKER_TO_NAME[ticker]}**: {market_name if market_name else 'No COT data available'}")
 
 with st.spinner("Crunching the numbers…"):
     dist_tree = build_tree(rvol_window)
 
+# Display JSON tree
 if category_selected == "All":
     st.subheader("Complete distribution tree")
     st.json(dist_tree)
@@ -260,36 +309,42 @@ else:
     st.subheader(f"{category_selected} distribution tree")
     st.json({category_selected: dist_tree.get(category_selected, {})})
 
+# Optional quick visualization
 if st.checkbox("Show quick visual for selected category"):
     cat_tree = dist_tree if category_selected == "All" else {category_selected: dist_tree.get(category_selected, {})}
     col1, col2 = st.columns(2)
+
     for cat, assets in cat_tree.items():
         col1.markdown(f"### {cat}")
         for asset, phases in assets.items():
             fig, ax = plt.subplots(figsize=(10, 6))
-            phase_colors = []
-            mean_vals = []
-            median_vals = []
+            phase_colors, mean_vals, median_vals = [], [], []
+
             for phase in ["Green", "Yellow", "Red"]:
                 if phase in phases:
                     phase_colors.append(phase)
                     mean_vals.append(phases[phase]["mean"])
                     median_vals.append(phases[phase]["median"])
+
             x = np.arange(len(phase_colors))
             width = 0.35
             ax.bar(x - width/2, mean_vals, width, color=[c.lower() for c in phase_colors], alpha=0.7, label='Mean')
             ax.bar(x + width/2, median_vals, width, color=[c.lower() for c in phase_colors], alpha=0.4, hatch='///', label='Median')
+
             for i, v in enumerate(mean_vals):
                 ax.text(i - width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
             for i, v in enumerate(median_vals):
                 ax.text(i + width/2, v + 0.1, f'{v:.1f}', ha='center', fontsize=9)
+
             ax.set_title(f"{asset} -- Daily Pip Range by Phase")
             ax.set_ylabel("Pips (10,000× abs pct change)")
             ax.set_xticks(x)
             ax.set_xticklabels(phase_colors)
             ax.legend()
             ax.grid(axis='y', linestyle='--', alpha=0.7)
+
             col1.pyplot(fig)
+
             stats_df = pd.DataFrame({
                 "Phase": phase_colors,
                 "Count": [phases[p]["count"] for p in phase_colors],
@@ -299,5 +354,6 @@ if st.checkbox("Show quick visual for selected category"):
                 "Max": [f"{phases[p]['max']:.2f}" for p in phase_colors],
                 "StdDev": [f"{phases[p]['std']:.2f}" for p in phase_colors],
             })
+
             col2.markdown(f"### {asset} Statistics")
             col2.dataframe(stats_df, use_container_width=True)
