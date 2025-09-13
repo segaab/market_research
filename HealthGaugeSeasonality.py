@@ -79,6 +79,13 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     time.sleep(YH_SLEEP)
     return df
 
+def _category_for_ticker(ticker: str) -> tuple[str, str]:
+    """Return (category, asset_name) for a given ticker"""
+    for category, tickers in ASSET_LEADERS.items():
+        if ticker in tickers:
+            return category, TICKER_TO_NAME.get(ticker, ticker)
+    return "", ticker
+
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     client = Socrata("publicreporting.cftc.gov", None, timeout=30)
@@ -103,17 +110,35 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame.from_records(rows)
+
+    # Check if required column exists before accessing it
+    if 'report_date_as_yyyy_mm_dd' not in df.columns:
+        return pd.DataFrame()  # Return empty DataFrame if key column is missing
+
     keep = [
         "report_date_as_yyyy_mm_dd",
         "open_interest_all",
         "commercial_long_all",
         "commercial_short_all",
     ]
+    keep = [col for col in keep if col in df.columns]
+
+    if "report_date_as_yyyy_mm_dd" not in keep:
+        return pd.DataFrame()
+
     df = df[keep]
     df = df.apply(pd.to_numeric, errors="ignore")
     df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
-    df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
+
+    if "commercial_long_all" in df.columns and "commercial_short_all" in df.columns:
+        df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
+
     return df.sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
+
+
+
+
+# app.py (Chunk 2)
 
 # ── METRICS ───────────────────────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -123,7 +148,7 @@ def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
     return out
 
 def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    if price.empty:
+    if price.empty or cot.empty:
         return pd.DataFrame()
     cot = cot.copy()
     cot["cot_date"] = cot["report_date_as_yyyy_mm_dd"] - pd.to_timedelta(
@@ -175,9 +200,6 @@ with st.spinner("Downloading & crunching …"):
         merged = add_health_gauge(merged)
         merged_data[t] = merged
 
-
-# app.py (Chunk 2)
-
 # ── VISUALISATIONS ────────────────────────────────────────────────────────────
 st.markdown("## Rolling Volatility")
 for t in tickers:
@@ -219,8 +241,6 @@ for t in tickers:
     st.plotly_chart(fig, use_container_width=True)
 
 # ── PIP & RETURN DISTRIBUTION TREE ─────────────────────────────────────────────
-import calendar
-
 def pip_and_return_tree_daily_pips(
     data: dict[str, pd.DataFrame], category: str, normalize: bool = True
 ) -> dict[str, dict]:
