@@ -321,7 +321,7 @@ for t in tickers:
 
     st.write(f"Profitability Accuracy: {accuracy_stats[t]}%")
 
-st.write("### Script Version: Monthly Return
+
 
 
 
