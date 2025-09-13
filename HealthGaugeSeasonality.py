@@ -1,42 +1,53 @@
-import pandas as pd
-import numpy as np
-import streamlit as st
+# app.py
+import time
 import json
-from yahooquery import Ticker
+import calendar
 import concurrent.futures
-from datetime import datetime
-import plotly.express as px
+from datetime import datetime, timedelta
+from typing import Dict, List
 
-# ── Asset definitions ──────────────────────────────────────────────────────────
-ASSET_LEADERS = {
-    "Indices": ["^GSPC"],
-    "Forex": ["EURUSD=X", "JPY=X"],
-    "Agricultural": ["ZS=F"],
-    "Energy": ["CL=F"],
-    "Metals": ["GC=F"],
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from sodapy import Socrata
+from yahooquery import Ticker
+
+# ── APP CONFIG ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Multi-Asset Health Gauge", layout="wide")
+START_DATE = "2013-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+COT_PAGE_SIZE = 15000       # Socrata max page size
+COT_SLEEP    = 0.35        # polite delay between pages (sec)
+YH_SLEEP     = 0.2         # polite delay between tickers (sec)
+
+# ── MAPPINGS ──────────────────────────────────────────────────────────────────
+ASSET_LEADERS: Dict[str, List[str]] = {
+    "Indices":       ["^GSPC"],
+    "Forex":         ["EURUSD=X", "JPY=X"],
+    "Agricultural":  ["ZS=F"],
+    "Energy":        ["CL=F"],
+    "Metals":        ["GC=F"],
 }
 
 TICKER_TO_NAME = {
-    "^GSPC": "S&P 500",
-    "EURUSD=X": "EUR/USD",
-    "JPY=X": "USD/JPY",
-    "ZS=F": "Soybeans",
-    "CL=F": "WTI Crude",
-    "GC=F": "Gold",
+    "^GSPC":   "S&P 500",
+    "EURUSD=X":"EUR/USD",
+    "JPY=X":   "USD/JPY",
+    "ZS=F":    "Soybeans",
+    "CL=F":    "WTI Crude",
+    "GC=F":    "Gold",
 }
 
-ProfitableSeasonalMap = {
-    "Indices": {"S&P 500": {m: "Green" for m in range(1, 13)}},
-    "Forex": {
-        "EUR/USD": {m: "Yellow" for m in range(1, 13)},
-        "USD/JPY": {m: "Red" for m in range(1, 13)},
-    },
-    "Agricultural": {"Soybeans": {m: "Green" for m in range(1, 13)}},
-    "Energy": {"WTI Crude": {m: "Yellow" for m in range(1, 13)}},
-    "Metals": {"Gold": {m: "Red" for m in range(1, 13)}},
+COT_NAMES = {
+    "EURUSD=X": "EURO FX -- Chicago Mercantile Exchange",
+    "JPY=X":     "JAPANESE YEN -- Chicago Mercantile Exchange",
+    "ZS=F":      "SOYBEANS -- Chicago Board of Trade",
+    "CL=F":      "WTI-PHYSICAL -- New York Mercantile Exchange",
+    "GC=F":      "GOLD -- Commodity Exchange Inc.",
 }
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 category_selected = st.sidebar.selectbox(
     "Choose Asset Category", list(ASSET_LEADERS.keys())
 )
@@ -44,143 +55,189 @@ rvol_window = st.sidebar.number_input(
     "RVol Rolling Window (days)", min_value=5, max_value=60, value=20
 )
 
-START_DATE = "2013-01-01"
-END_DATE = datetime.today().strftime("%Y-%m-%d")
+# ── CACHING HELPERS ───────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _yahoo_session() -> Ticker:
+    "One shared YahooQuery client (re-uses HTTP session & cookies)."
+    return Ticker([])          # empty now; symbols added per request
 
-# ── Helper functions ───────────────────────────────────────────────────────────
-def fetch_single(ticker: str) -> tuple[str, pd.DataFrame]:
-    t = Ticker(ticker)
-    df = t.history(start=START_DATE, end=END_DATE)
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def fetch_price_history(ticker: str) -> pd.DataFrame:
+    "Daily OHLCV from Yahoo; cached for 1 h."
+    yq = _yahoo_session()
+    yq.symbols = [ticker]      # attach symbol dynamically
+    df = yq.history(start=START_DATE, end=END_DATE, auto_adjust=False)
     if df.empty:
-        return ticker, pd.DataFrame()
+        return pd.DataFrame()
 
-    df.reset_index(inplace=True)
-    # Make dates tz-naive
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-
-    # Rolling volatility
-    df["rvol"] = df["close"].pct_change().rolling(rvol_window).std() * np.sqrt(rvol_window)
-
-    # NEW: daily percentage returns
+    df = df.reset_index()
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    # RVol needs raw volume – keep 0 instead of NaN so rolling mean works
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["return_pct"] = df["close"].pct_change() * 100
-    return ticker, df
+    time.sleep(YH_SLEEP)       # polite spacing
+    return df
 
-
-def fetch_all_asset_data(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    data: dict[str, pd.DataFrame] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(fetch_single, t) for t in tickers]
-        for f in concurrent.futures.as_completed(futures):
-            ticker, df = f.result()
-            data[ticker] = df
-    return data
-
-
-def _category_for_ticker(tkr: str) -> tuple[str | None, str | None]:
-    for cat, lst in ASSET_LEADERS.items():
-        if tkr in lst:
-            return cat, TICKER_TO_NAME[tkr]
-    return None, None
-
-
-def pip_distribution_tree(
-    data: dict[str, pd.DataFrame], category: str
-) -> dict[str, dict]:
-    """
-    Build distribution tree ONLY for the currently selected category.
-    Adds normalized counts for every colour phase.
-    """
-    tree: dict[str, dict] = {}
-
-    for tkr, df in data.items():
-        cat, asset_name = _category_for_ticker(tkr)
-        if cat != category or df.empty:
-            continue
-
-        temp = df.copy()
-        temp["month_num"] = pd.to_datetime(temp["date"]).dt.month
-        temp["phase"] = temp["month_num"].map(
-            lambda m: ProfitableSeasonalMap[cat][asset_name][m]
-        )
-
-        # Aggregate stats
-        agg = temp.groupby("phase")["close"].agg(["min", "max", "mean", "count"])
-        agg["normalized"] = agg["count"] / agg["count"].sum()
-        tree[asset_name] = agg.round(4).to_dict(orient="index")
-
-    return tree
-
-
-# ── Orchestrate ────────────────────────────────────────────────────────────────
-tickers_to_process = ASSET_LEADERS[category_selected]
-
-with st.spinner("Crunching the numbers…"):
-    data = fetch_all_asset_data(tickers_to_process)
-    dist_tree = pip_distribution_tree(data, category_selected)
-
-# NEW ➜ build a stacked dataframe of daily returns
-df_results = (
-    pd.concat(
-        [
-            df.loc[df["return_pct"].notna(), ["date", "return_pct"]].assign(
-                asset=TICKER_TO_NAME[tkr]
-            )
-            for tkr, df in data.items()
-            if not df.empty
-        ],
-        ignore_index=True,
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
+    "Weekly COT report; full-day cache"
+    client = Socrata("publicreporting.cftc.gov", None, timeout=30)
+    where = (
+        f"market_and_exchange_names='{cot_name}' AND "
+        f"report_date_as_yyyy_mm_dd >= '{start_date}' AND "
+        f"report_date_as_yyyy_mm_dd <= '{end_date}'"
     )
-)
 
+    rows: List[dict] = []
+    offset = 0
+    while True:
+        batch = client.get("6dca-aqww", where=where,
+                           order="report_date_as_yyyy_mm_dd",
+                           limit=COT_PAGE_SIZE, offset=offset)
+        if not batch:
+            break
+        rows.extend(batch)
+        offset += COT_PAGE_SIZE
+        if len(batch) < COT_PAGE_SIZE:
+            break
+        time.sleep(COT_SLEEP)
 
+    if not rows:
+        return pd.DataFrame()
 
+    df = pd.DataFrame.from_records(rows)
+    keep = [
+        "report_date_as_yyyy_mm_dd",
+        "open_interest_all",
+        "commercial_long_all",
+        "commercial_short_all",
+    ]
+    df = df[keep]
+    df = df.apply(pd.to_numeric, errors="ignore")
+    df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
+    df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
+    return df.sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
 
-# ── Visualisation: rolling volatility ──────────────────────────────────────────
-for tkr in tickers_to_process:
-    df = data.get(tkr, pd.DataFrame())
+# ── METRICS ───────────────────────────────────────────────────────────────────
+def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
+    out = df.copy()
+    rolling_mean = out["volume"].rolling(window).mean().replace(0, np.nan)
+    out["rvol"] = out["volume"] / rolling_mean
+    return out
+
+def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
+    if price.empty:
+        return pd.DataFrame()
+
+    # align COT weekly report date (usually Tue) with previous Fri close
+    cot = cot.copy()
+    cot["cot_date"] = cot["report_date_as_yyyy_mm_dd"] - pd.to_timedelta(
+        cot["report_date_as_yyyy_mm_dd"].dt.weekday - 4, unit="D"
+    )
+    cot = cot[["cot_date", "commercial_long_all", "commercial_short_all"]]
+
+    merged = pd.merge_asof(
+        price.sort_values("date"),
+        cot.sort_values("cot_date"),
+        left_on="date",
+        right_on="cot_date",
+        direction="backward",
+    )
+    merged = merged.drop(columns="cot_date")
+
+    # normalised long/short shares
+    total = (merged["commercial_long_all"] + merged["commercial_short_all"]).replace(0, np.nan)
+    merged["cot_long_norm"]  = merged["commercial_long_all"]  / total
+    merged["cot_short_norm"] = merged["commercial_short_all"] / total
+    return merged
+
+def add_health_gauge(df: pd.DataFrame,
+                     weights: Dict[str, float] = {"rvol": .5, "cot_long": .3, "cot_short": .2}
+                    ) -> pd.DataFrame:
+    out = df.copy()
+    out["health_gauge"] = (
+        weights["rvol"]      * out["rvol"].fillna(1) +
+        weights["cot_long"]  * out["cot_long_norm"].fillna(0) -
+        weights["cot_short"] * out["cot_short_norm"].fillna(0)
+    )
+    return out
+
+# ── FETCH ALL DATA ────────────────────────────────────────────────────────────
+tickers = ASSET_LEADERS[category_selected]
+
+with st.spinner("Downloading & crunching …"):
+    # Yahoo prices in parallel --------------------------------------------------
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        price_futs = {ex.submit(fetch_price_history, t): t for t in tickers}
+        price_data = {price_futs[f]: f.result() for f in concurrent.futures.as_completed(price_futs)}
+
+    # COT sequential (already cached & throttled) ------------------------------
+    cot_data = {t: fetch_cot_data(COT_NAMES.get(t, ""), START_DATE, END_DATE)
+                for t in tickers}
+
+    # merge, rvol, health ------------------------------------------------------
+    merged_data = {}
+    for t in tickers:
+        price = add_rvol(price_data[t], rvol_window)
+        merged = merge_cot_price(cot_data[t], price)
+        merged = add_health_gauge(merged)
+        merged_data[t] = merged
+
+# ── VISUALISATIONS ────────────────────────────────────────────────────────────
+st.markdown("## Rolling Volatility")
+for t in tickers:
+    df = merged_data[t]
     if df.empty:
-        st.warning(f"No data for {TICKER_TO_NAME[tkr]}")
+        st.warning(f"No data for {TICKER_TO_NAME[t]}")
         continue
-
-    fig = px.line(
-        df,
-        x="date",
-        y="rvol",
-        title=f"{TICKER_TO_NAME[tkr]} Rolling Volatility",
-        template="plotly_white",
-    )
-    fig.update_layout(
-        xaxis_title="Date",
-        yaxis_title="Rolling Volatility",
-        title_font_size=18,
-        margin=dict(l=20, r=20, t=40, b=20),
-    )
+    fig = px.line(df, x="date", y="rvol",
+                  title=f"{TICKER_TO_NAME[t]} — RVol ({rvol_window}-day)",
+                  template="plotly_white")
+    fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-# ── Return-distribution visual ─────────────────────────────────────────────────
-if not df_results.empty:
-    st.subheader("Return Distribution")
-    fig = px.histogram(
-        df_results,
-        x="return_pct",
-        nbins=20,
-        title="Return Distribution (%)",
-        color_discrete_sequence=["#3366CC"],
-    )
+# ── RETURN DISTRIBUTION ───────────────────────────────────────────────────────
+st.markdown("## Return Distribution")
+df_results = pd.concat(
+    [d.loc[d["return_pct"].notna(), ["return_pct"]].assign(asset=TICKER_TO_NAME[t])
+     for t, d in merged_data.items() if not d.empty],
+    ignore_index=True
+)
+if df_results.empty:
+    st.info("No return data available.")
+else:
+    fig = px.histogram(df_results, x="return_pct", nbins=20,
+                       color_discrete_sequence=["#3366CC"],
+                       title="Daily % Return Distribution")
     fig.add_vline(x=0, line_dash="dash", line_color="red")
     st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("No valid return data available for the selected asset group.")
 
-# ── JSON tree + download ───────────────────────────────────────────────────────
-st.subheader("Pip Range Distribution Tree")
-st.json(dist_tree)
+# ── HEALTH GAUGE OVER TIME ────────────────────────────────────────────────────
+st.markdown("## Health Gauge")
+for t in tickers:
+    df = merged_data[t]
+    if df.empty:
+        continue
+    fig = px.line(df, x="date", y="health_gauge",
+                  title=f"{TICKER_TO_NAME[t]} — Health Gauge",
+                  template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
 
-json_filename = f"pip_distribution_{category_selected.replace(' ', '_')}.json"
+# ── JSON DOWNLOAD ─────────────────────────────────────────────────────────────
+st.markdown("## Download Merged Data")
+export_cols = [
+    "date", "open", "high", "low", "close", "volume",
+    "return_pct", "rvol",
+    "commercial_long_all", "commercial_short_all",
+    "cot_long_norm", "cot_short_norm", "health_gauge"
+]
+payload = {
+    t: d[export_cols].round(6).fillna(None).to_dict(orient="records")
+    for t, d in merged_data.items() if not d.empty
+}
 st.download_button(
-    label="Download JSON Tree",
-    data=json.dumps(dist_tree, indent=4),
-    file_name=json_filename,
+    "Download JSON",
+    data=json.dumps(payload, indent=2, default=str),
+    file_name=f"health_gauge_daily_pip_stats_{category_selected}.json",
     mime="application/json",
 )
