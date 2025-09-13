@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -----------------------------------------------------------------------------
-# Multi-Asset Health Gauge – Streamlit application (Monthly version)
+# Multi-Asset Health Gauge -- Streamlit application (Monthly version)
 # -----------------------------------------------------------------------------
 import json
 import time
@@ -210,20 +210,33 @@ def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
     merged["cot_short_norm"] = merged["commercial_short_all"]/tot
     return merged
 
-def add_health_gauge(df: pd.DataFrame,
-                     weights: Dict[str,float] = {"rvol":0.5,"cot_long":0.3,"cot_short":0.2}) -> pd.DataFrame:
+def add_health_gauge(
+    df: pd.DataFrame,
+    weights: Dict[str, float] | None = None
+) -> pd.DataFrame:
+    """
+    Combine relative volume and COT positioning into a single 'health_gauge'
+    score.  Works even when one of the inputs is missing.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
+
+    if weights is None:
+        weights = {"rvol": 0.5, "cot_long": 0.3, "cot_short": 0.2}
+
     out = df.copy()
+
+    # Ensure we always operate on Series instead of scalars
+    rvol_s      = out.get("rvol",            pd.Series(1.0, index=out.index))
+    cot_long_s  = out.get("cot_long_norm",   pd.Series(0.0, index=out.index))
+    cot_short_s = out.get("cot_short_norm",  pd.Series(0.0, index=out.index))
+
     out["health_gauge"] = (
-        weights["rvol"]*out.get("rvol",1).fillna(1) +
-        weights["cot_long"]*out.get("cot_long_norm",0).fillna(0) -
-        weights["cot_short"]*out.get("cot_short_norm",0).fillna(0)
+        weights["rvol"]      * rvol_s.fillna(1) +
+        weights["cot_long"]  * cot_long_s.fillna(0) -
+        weights["cot_short"] * cot_short_s.fillna(0)
     )
     return out
-
-
-
 
 # ── MAIN FETCH & MERGE ───────────────────────────────────────────────────────
 tickers = ASSET_LEADERS[category_selected]
