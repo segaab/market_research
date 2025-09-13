@@ -100,7 +100,14 @@ normalize_monthly_checkbox = st.sidebar.checkbox(
 # ── CACHING HELPERS ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _yahoo_session() -> Ticker:
+    # Initialize Yahoo session once
     return Ticker([])
+
+@st.cache_resource(show_spinner=False)
+def _socrata_client() -> Socrata:
+    # Initialize Socrata client once
+    SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
+    return Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=120)
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_price_history(ticker: str) -> pd.DataFrame:
@@ -116,14 +123,11 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     time.sleep(YH_SLEEP)
     return df
 
-# ── COT FETCH ───────────────────────────────────────────────────────────────
-SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
-
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     if not cot_name:
         return pd.DataFrame()
-    client = Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=120)
+    client = _socrata_client()
     where = (
         f"market_and_exchange_names='{cot_name}' AND "
         f"report_date_as_yyyy_mm_dd >= '{start_date}' AND "
@@ -153,6 +157,7 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     df["timestamp"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
     if {"commercial_long_all","commercial_short_all"} <= set(df.columns):
         df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
+    # Forward fill to daily
     df_daily = (
         df.set_index("timestamp")
           .sort_index()
@@ -162,6 +167,7 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
           .rename(columns={"index": "timestamp"})
     )
     return df_daily.sort_values("timestamp").reset_index(drop=True)
+
 
 # ── METRICS ────────────────────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -178,7 +184,7 @@ def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
     
     cot_copy = cot.copy()
     cot_copy["cot_date"] = cot_copy["timestamp"] - pd.to_timedelta(cot_copy["timestamp"].dt.weekday - 4, unit="D")
-    cot_copy = cot_copy[["cot_date","commercial_long_all","commercial_short_all"]]
+    cot_copy = cot_copy[["cot_date","commercial_long_all","commercial_short_all","open_interest_all","commercial_net"]]
     
     merged = pd.merge_asof(
         price.sort_values("timestamp"),
@@ -189,38 +195,19 @@ def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
     tot = (merged.get("commercial_long_all",0) + merged.get("commercial_short_all",0)).replace(0,np.nan)
     merged["cot_long_norm"] = merged.get("commercial_long_all",0) / tot
     merged["cot_short_norm"] = merged.get("commercial_short_all",0) / tot
-    
+    merged["health_gauge"] = (
+        0.5*merged["rvol"].fillna(1) + 0.3*merged["cot_long_norm"].fillna(0) - 0.2*merged["cot_short_norm"].fillna(0)
+    )
     return merged
 
-# ── HEALTH GAUGE ─────────────────────────────────────────────────────────────
-def add_health_gauge(df: pd.DataFrame, weights: Dict[str,float] = {"rvol":0.5,"cot_long":0.3,"cot_short":0.2}) -> pd.DataFrame:
-    out = df.copy()
-    for col in ["rvol","cot_long_norm","cot_short_norm"]:
-        if col not in out.columns:
-            out[col] = 0
-    out["health_gauge"] = (
-        weights["rvol"]*out["rvol"].fillna(1) +
-        weights["cot_long"]*out["cot_long_norm"].fillna(0) -
-        weights["cot_short"]*out["cot_short_norm"].fillna(0)
-    )
-    return out
-
-# ── DAILY PIP RANGE & STATS ─────────────────────────────────────────────────
-def compute_daily_pip_stats(df: pd.DataFrame) -> pd.DataFrame:
+def compute_daily_pip_range(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or not {"high","low"}.issubset(df.columns):
         return pd.DataFrame()
-    df_daily = df.copy()
-    df_daily["pip_range"] = df_daily["high"] - df_daily["low"]
-    daily_stats = df_daily.groupby(df_daily["timestamp"].dt.date).agg(
-        pip_range_24h=("pip_range", lambda x: list(x)),
-        daily_mean_pip=("pip_range", "mean"),
-        daily_median_pip=("pip_range", "median"),
-        sd_pip_24h=("pip_range", lambda x: list(np.std(x, ddof=1))),
-        daily_health_gauge=("health_gauge", "mean")
-    ).reset_index().rename(columns={"timestamp":"date"})
-    return daily_stats
+    df["pip_range"] = df["high"] - df["low"]
+    df["month"] = df["timestamp"].dt.to_period("M").dt.month
+    monthly_pip = df.groupby("month")["pip_range"].mean().reset_index()
+    return monthly_pip
 
-# ── MONTHLY RETURNS & PROFITABILITY ──────────────────────────────────────────
 def compute_monthly_returns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -245,37 +232,33 @@ def calculate_accuracy(df: pd.DataFrame, asset_name: str, category: str) -> floa
     df["actual_hit"] = df.apply(lambda x: 1 if ((x["expected"]=="✅" and x["profit_label"]=="Profitable") or (x["expected"]=="❌" and x["profit_label"]=="Unprofitable")) else 0, axis=1)
     return round(df["actual_hit"].mean()*100,2)
 
-# ── PROCESS CATEGORY ─────────────────────────────────────────────────────────
+# ── PROCESS CATEGORY & JSON EXPORT ──────────────────────────────────────────
 def process_category(category: str):
     tickers = ASSET_LEADERS.get(category,[])
     merged_data = {}
     monthly_distribution = {}
     accuracy_stats = {}
     pip_range_stats = {}
-    healthgauge_dfs = {}
 
     for t in tickers:
-        # FETCH
         price = fetch_price_history(t)
         cot = fetch_cot_data(COT_ASSET_NAMES.get(t,""), START_DATE, END_DATE)
-
-        # PROCESS
         price = add_rvol(price, rvol_window)
-        health_df = add_health_gauge(merge_cot_price(cot, price))
-        healthgauge_dfs[t] = health_df
-        merged_data[t] = health_df.copy()
+        merged_df = merge_cot_price(cot, price)
+        merged_data[t] = merged_df.copy()
 
-        monthly = compute_monthly_returns(health_df)
+        monthly = compute_monthly_returns(merged_df)
         monthly = assign_profit_labels(monthly)
         monthly_distribution[t] = monthly
         accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category)
 
-        pip_range_stats[t] = compute_daily_pip_stats(health_df)
+        pip_range_stats[t] = compute_daily_pip_range(price)
 
     # ── JSON EXPORT
+    export_cols = ["timestamp","close","rvol","cot_long_norm","cot_short_norm","health_gauge","return_pct","profit_label"]
     payload_merged = {
-        t: pip_range_stats[t].round(6).fillna("").to_dict(orient="records")
-        for t in pip_range_stats if not pip_range_stats[t].empty
+        t: d[export_cols].round(6).fillna("").to_dict(orient="records")
+        for t,d in merged_data.items() if not d.empty
     }
 
     monthly_payload = {
@@ -285,17 +268,36 @@ def process_category(category: str):
 
     accuracy_payload = {t: {"accuracy_pct": accuracy_stats[t]} for t in accuracy_stats}
 
+    pip_payload = {
+        t: pip_range_stats[t].round(6).fillna("").to_dict(orient="records")
+        for t in pip_range_stats if not pip_range_stats[t].empty
+    }
+
+    full_json_payload = {
+        category: {
+            "merged_data": payload_merged
+        }
+    }
+
+    distribution_json_payload = {
+        category: {
+            "monthly_returns": monthly_payload,
+            "accuracy_distribution": accuracy_payload,
+            "monthly_pip_range": pip_payload
+        }
+    }
+
     st.download_button(
-        label="Download Daily Health + Pip Stats JSON",
-        data=json.dumps(payload_merged, indent=2, default=str),
-        file_name=f"daily_health_pip_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        label="Download Health Gauge JSON",
+        data=json.dumps(full_json_payload, indent=2, default=str),
+        file_name=f"health_gauge_data_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json"
     )
 
     st.download_button(
-        label="Download Monthly Stats JSON",
-        data=json.dumps({"monthly_returns": monthly_payload, "accuracy_distribution": accuracy_payload}, indent=2, default=str),
-        file_name=f"monthly_stats_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        label="Download Distribution Stats JSON",
+        data=json.dumps(distribution_json_payload, indent=2, default=str),
+        file_name=f"health_gauge_distribution_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json"
     )
 
@@ -304,7 +306,7 @@ def process_category(category: str):
         if t not in merged_data or merged_data[t].empty:
             continue
         df_plot = merged_data[t]
-        fig = px.line(df_plot, x="date", y="daily_health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
+        fig = px.line(df_plot, x="timestamp", y="health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
         st.plotly_chart(fig, use_container_width=True)
 
         monthly_df = monthly_distribution[t]
@@ -323,4 +325,4 @@ def process_category(category: str):
 # ── RUN PROCESS ON CATEGORY SELECTION
 process_category(category_selected)
 
-st.write("### Script Version: Daily Health Gauge + Pip Stats + Monthly Returns JSON Export")
+st.write("### Script Version: Monthly Return Distribution + Pip Stats + JSON Export")
