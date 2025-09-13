@@ -293,9 +293,17 @@ def calculate_accuracy(df: pd.DataFrame, asset_name: str) -> float:
 accuracy_stats = {t: calculate_accuracy(monthly_distribution[t], TICKER_TO_NAME[t]) for t in tickers}
 
 # ── JSON EXPORT ─────────────────────────────────────────────────────────────
-export_cols = ["timestamp", "close", "rvol", "cot_long_norm", "cot_short_norm", "health_gauge", "return_pct", "profit_label"]
+export_cols = [
+    "timestamp", "close", "rvol",
+    "cot_long_norm", "cot_short_norm",
+    "health_gauge", "return_pct"
+]
+
 payload_merged = {
-    t: d[export_cols].round(6).fillna(0).to_dict(orient="records")
+    t: (d.reindex(columns=export_cols)      # add missing cols if necessary
+          .round(6)
+          .fillna(0)                       # replace NaN introduced by reindex
+          .to_dict(orient="records"))
     for t, d in merged_data.items() if not d.empty
 }
 
@@ -305,6 +313,7 @@ st.download_button(
     file_name="health_gauge_monthly.json",
     mime="application/json"
 )
+
 
 # ── VISUALIZATIONS ──────────────────────────────────────────────────────────
 for t in tickers:
