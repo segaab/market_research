@@ -19,10 +19,10 @@ import concurrent.futures
 # ── APP CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Multi-Asset Health Gauge", layout="wide")
 
-START_DATE = "2013-01-01"
 END_DATE = datetime.today().strftime("%Y-%m-%d")
+START_DATE = (datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
 
-COT_PAGE_SIZE = 15_000
+COT_PAGE_SIZE = 15000
 COT_SLEEP = 0.35
 YH_SLEEP = 0.20
 
@@ -163,7 +163,7 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     )
     return df_daily.sort_values("timestamp").reset_index(drop=True)
 
-# ── METRICS ────────────────────────────────────────────────────────────────
+# ── METRICS & CALCULATIONS ───────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out = df.copy()
     out["rvol"] = out["volume"] / out["volume"].rolling(window).mean().replace(0, np.nan)
@@ -198,9 +198,8 @@ def add_health_gauge(df: pd.DataFrame, weights: Dict[str,float] = {"rvol":0.5, "
 def compute_monthly_returns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    df["month"] = df["timestamp"].dt.to_period("M")
+    df["month"] = df["timestamp"].dt.to_period("M").dt.month
     monthly_returns = df.groupby("month")["return_pct"].sum().reset_index()
-    monthly_returns["month"] = monthly_returns["month"].dt.to_timestamp()
     return monthly_returns
 
 def assign_profit_labels(df: pd.DataFrame) -> pd.DataFrame:
@@ -216,15 +215,25 @@ def calculate_accuracy(df: pd.DataFrame, asset_name: str, category: str) -> floa
         return 0.0
     top_key = "Commodities" if category in ("Agricultural","Energy","Metals") else category
     monthly_map = ProfitableSeasonalMap.get(top_key, {}).get(asset_name, {})
-    df["expected"] = df["month"].dt.month.map(lambda m: monthly_map.get(calendar.month_abbr[m],"⚪"))
+    df["expected"] = df["month"].map(lambda m: monthly_map.get(calendar.month_abbr[m],"⚪"))
     df["actual_hit"] = df.apply(lambda x: 1 if ((x["expected"]=="✅" and x["profit_label"]=="Profitable") or (x["expected"]=="❌" and x["profit_label"]=="Unprofitable")) else 0, axis=1)
     return round(df["actual_hit"].mean()*100,2)
+
+# ── DAILY PIP RANGE ─────────────────────────────────────────────────────────
+def compute_daily_pip_range(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or not {"high", "low"}.issubset(df.columns):
+        return pd.DataFrame()
+    df["pip_range"] = df["high"] - df["low"]
+    df["month"] = df["timestamp"].dt.to_period("M").dt.month
+    monthly_pip = df.groupby("month")["pip_range"].mean().reset_index()
+    return monthly_pip
 
 # ── FETCH, MERGE & CALCULATE ───────────────────────────────────────────────
 tickers = ASSET_LEADERS[category_selected]
 merged_data = {}
 monthly_distribution = {}
 accuracy_stats = {}
+pip_range_stats = {}
 
 for t in tickers:
     price = fetch_price_history(t)
@@ -238,8 +247,7 @@ for t in tickers:
     monthly_distribution[t] = monthly
     accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category_selected)
 
-
-
+    pip_range_stats[t] = compute_daily_pip_range(price)
 
 # ── JSON EXPORT ─────────────────────────────────────────────────────────────
 export_cols = ["timestamp","close","rvol","cot_long_norm","cot_short_norm","health_gauge","return_pct","profit_label"]
@@ -255,16 +263,40 @@ monthly_payload = {
 
 accuracy_payload = {t: {"accuracy_pct": accuracy_stats[t]} for t in accuracy_stats}
 
+pip_payload = {
+    t: pip_range_stats[t].round(6).fillna("").to_dict(orient="records")
+    for t in pip_range_stats if not pip_range_stats[t].empty
+}
+
 full_json_payload = {
-    "merged_data": payload_merged,
-    "monthly_returns": monthly_payload,
-    "accuracy_distribution": accuracy_payload
+    "merged_data": payload_merged
+}
+
+distribution_json_payload = {
+    "standard": {
+        "monthly_returns": monthly_payload,
+        "accuracy_distribution": accuracy_payload,
+        "monthly_pip_range": pip_payload
+    },
+    "enhanced": {
+        # Could add normalized counts or percentile ranks here if needed
+        "monthly_returns": monthly_payload,
+        "accuracy_distribution": accuracy_payload,
+        "monthly_pip_range": pip_payload
+    }
 }
 
 st.download_button(
     label="Download Health Gauge JSON",
     data=json.dumps(full_json_payload, indent=2, default=str),
     file_name=f"health_gauge_data_{datetime.now().strftime('%Y%m%d')}.json",
+    mime="application/json"
+)
+
+st.download_button(
+    label="Download Distribution Stats JSON",
+    data=json.dumps(distribution_json_payload, indent=2, default=str),
+    file_name=f"health_gauge_distribution_{category_selected}_{datetime.now().strftime('%Y%m%d')}.json",
     mime="application/json"
 )
 
@@ -289,4 +321,38 @@ for t in tickers:
 
     st.write(f"Profitability Accuracy: {accuracy_stats[t]}%")
 
+st.write("### Script Version: Monthly Return
+
+
+
+
+
+
 st.write("### Script Version: Monthly Return Distribution + Pip Stats + JSON Export")
+
+# ── ASSET GROUP SELECTION TRIGGER ─────────────────────────────────────────────
+def refresh_on_category_change():
+    global merged_data, monthly_distribution, accuracy_stats, pip_range_stats
+
+    tickers = ASSET_LEADERS[category_selected]
+    merged_data = {}
+    monthly_distribution = {}
+    accuracy_stats = {}
+    pip_range_stats = {}
+
+    for t in tickers:
+        price = fetch_price_history(t)
+        cot = fetch_cot_data(COT_ASSET_NAMES.get(t,""), START_DATE, END_DATE)
+        price = add_rvol(price, rvol_window)
+        merged = add_health_gauge(merge_cot_price(cot, price))
+        merged_data[t] = merged
+
+        monthly = compute_monthly_returns(merged)
+        monthly = assign_profit_labels(monthly)
+        monthly_distribution[t] = monthly
+        accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category_selected)
+
+        pip_range_stats[t] = compute_daily_pip_range(price)
+
+# Run refresh whenever asset group is selected
+refresh_on_category_change()
