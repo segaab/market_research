@@ -55,9 +55,6 @@ rvol_window = st.sidebar.number_input(
     "RVol Rolling Window (days)", min_value=5, max_value=60, value=20
 )
 
-# ── MONTH OBJECT LIST ──────────────────────────────────────────────────────────
-MONTHS = [{"num": i, "abbr": calendar.month_abbr[i]} for i in range(1, 13)]
-
 # ── CACHING HELPERS ───────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _yahoo_session() -> Ticker:
@@ -68,7 +65,7 @@ def _yahoo_session() -> Ticker:
 def fetch_price_history(ticker: str) -> pd.DataFrame:
     "Daily OHLCV from Yahoo; cached for 1 h."
     yq = _yahoo_session()
-    yq.symbols = [ticker]
+    yq.symbols = [ticker]      # attach symbol dynamically
     df = yq.history(start=START_DATE, end=END_DATE, auto_adjust=False)
     if df.empty:
         return pd.DataFrame()
@@ -76,7 +73,7 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["return_pct"] = df["close"].pct_change() * 100
-    time.sleep(YH_SLEEP)
+    time.sleep(YH_SLEEP)       # polite spacing
     return df
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
@@ -155,33 +152,54 @@ def add_health_gauge(df: pd.DataFrame,
     )
     return out
 
-# ── HELPER: PIP DISTRIBUTION TREE ──────────────────────────────────────────────
 def _category_for_ticker(tkr: str) -> tuple[str | None, str | None]:
     for cat, lst in ASSET_LEADERS.items():
         if tkr in lst:
             return cat, TICKER_TO_NAME[tkr]
     return None, None
 
-def pip_distribution_tree(
-    data: dict[str, pd.DataFrame], category: str
-) -> dict[str, dict]:
+# ── FETCH ALL DATA ────────────────────────────────────────────────────────────
+tickers = ASSET_LEADERS[category_selected]
+with st.spinner("Downloading & crunching …"):
+    # Yahoo prices in parallel --------------------------------------------------
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        price_futs = {ex.submit(fetch_price_history, t): t for t in tickers}
+        price_data = {price_futs[f]: f.result() for f in concurrent.futures.as_completed(price_futs)}
+
+    # COT sequential (cached & throttled) --------------------------------------
+    cot_data = {t: fetch_cot_data(COT_NAMES.get(t, ""), START_DATE, END_DATE) for t in tickers}
+
+    # Merge, rvol, health ------------------------------------------------------
+    merged_data = {}
+    for t in tickers:
+        price = add_rvol(price_data[t], rvol_window)
+        merged = merge_cot_price(cot_data[t], price)
+        merged = add_health_gauge(merged)
+        merged_data[t] = merged
+
+# ── PIP DISTRIBUTION ──────────────────────────────────────────────────────────
+def pip_distribution_tree(data: dict[str, pd.DataFrame], category: str):
     tree: dict[str, dict] = {}
+    month_list = [calendar.month_abbr[m] for m in range(1, 13)]
+
     for tkr, df in data.items():
         cat, asset_name = _category_for_ticker(tkr)
         if cat != category or df.empty:
             continue
         tmp = df.copy()
         tmp["month_num"] = pd.to_datetime(tmp["date"]).dt.month
+
         monthly = (
             tmp.groupby("month_num")["close"]
             .agg(["min", "max", "mean", "count"])
             .sort_index()
         )
         monthly["normalized"] = monthly["count"] / monthly["count"].sum()
+
         month_dict: dict[str, dict] = {}
         for m, row in monthly.round(4).iterrows():
-            month_name = calendar.month_abbr[m]
-            month_dict[month_name] = row.to_dict()
+            month_dict[calendar.month_abbr[m]] = row.to_dict()
+
         agg_row = {
             "min": round(tmp["close"].min(), 4),
             "max": round(tmp["close"].max(), 4),
@@ -190,73 +208,4 @@ def pip_distribution_tree(
             "normalized": 1.0,
         }
         month_dict["Aggregate"] = agg_row
-        tree[asset_name] = month_dict
-    return tree
-
-# ── FETCH ALL DATA ────────────────────────────────────────────────────────────
-tickers = ASSET_LEADERS[category_selected]
-
-with st.spinner("Downloading & crunching …"):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-        price_futs = {ex.submit(fetch_price_history, t): t for t in tickers}
-        price_data = {price_futs[f]: f.result() for f in concurrent.futures.as_completed(price_futs)}
-    cot_data = {t: fetch_cot_data(COT_NAMES.get(t, ""), START_DATE, END_DATE) for t in tickers}
-    merged_data = {}
-    for t in tickers:
-        price = add_rvol(price_data[t], rvol_window)
-        merged = merge_cot_price(cot_data[t], price)
-        merged = add_health_gauge(merged)
-        merged_data[t] = merged
-
-# ── VISUALISATIONS ───────────────────────────────────────────────────────────
-st.markdown("## Rolling Volatility")
-for t in tickers:
-    df = merged_data[t]
-    if df.empty:
-        st.warning(f"No data for {TICKER_TO_NAME[t]}")
-        continue
-    fig = px.line(df, x="date", y="rvol",
-                  title=f"{TICKER_TO_NAME[t]} — RVol ({rvol_window}-day)",
-                  template="plotly_white")
-    fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-    st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("## Return Distribution")
-df_results = pd.concat(
-    [d.loc[d["return_pct"].notna(), ["return_pct"]].assign(asset=TICKER_TO_NAME[t])
-     for t, d in merged_data.items() if not d.empty],
-    ignore_index=True
-)
-if df_results.empty:
-    st.info("No return data available.")
-else:
-    fig = px.histogram(df_results, x="return_pct", nbins=20,
-                       color_discrete_sequence=["#3366CC"],
-                       title="Daily % Return Distribution")
-    fig.add_vline(x=0, line_dash="dash", line_color="red")
-    st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("## Health Gauge")
-for t in tickers:
-    df = merged_data[t]
-    if df.empty:
-        continue
-    fig = px.line(df, x="date", y="health_gauge",
-                  title=f"{TICKER_TO_NAME[t]} — Health Gauge",
-                  template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
-# ── PIP DISTRIBUTION JSON ─────────────────────────────────────────────────────
-dist_tree = pip_distribution_tree(merged_data, category_selected)
-st.markdown("## Pip Distribution Tree")
-st.json(dist_tree)
-st.download_button(
-    "Download JSON Tree",
-    data=json.dumps(dist_tree, indent=2, default=str),
-    file_name=f"pip_distribution_{category_selected}.json",
-    mime="application/json",
-)
-
-# ── MONTHS REFERENCE ──────────────────────────────────────────────────────────
-st.markdown("## Months Reference")
-st.write(MONTHS)
+        tree[asset_name] = month
