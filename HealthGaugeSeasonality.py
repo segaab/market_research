@@ -40,13 +40,13 @@ TICKER_TO_NAME = {
 }
 
 COT_ASSET_NAMES = {
-    "^GSPC": "S&P 500 – Chicago Mercantile Exchange",
+    "^GSPC": "S&P 500 -- Chicago Mercantile Exchange",
     "^GDAXI": None,
-    "EURUSD=X": "EURO FX – Chicago Mercantile Exchange",
-    "USDJPY=X": "JAPANESE YEN – Chicago Mercantile Exchange",
-    "ZS=F": "SOYBEANS – Chicago Board of Trade",
-    "CL=F": "WTI-PHYSICAL – New York Mercantile Exchange",
-    "GC=F": "GOLD – Commodity Exchange Inc."
+    "EURUSD=X": "EURO FX -- Chicago Mercantile Exchange",
+    "USDJPY=X": "JAPANESE YEN -- Chicago Mercantile Exchange",
+    "ZS=F": "SOYBEANS -- Chicago Board of Trade",
+    "CL=F": "WTI-PHYSICAL -- New York Mercantile Exchange",
+    "GC=F": "GOLD -- Commodity Exchange Inc."
 }
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -79,13 +79,6 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     time.sleep(YH_SLEEP)
     return df
 
-def _category_for_ticker(ticker: str) -> tuple[str, str]:
-    """Return (category, asset_name) for a given ticker"""
-    for category, tickers in ASSET_LEADERS.items():
-        if ticker in tickers:
-            return category, TICKER_TO_NAME.get(ticker, ticker)
-    return "", ticker
-
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     client = Socrata("publicreporting.cftc.gov", None, timeout=30)
@@ -110,35 +103,34 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame.from_records(rows)
-
+    
     # Check if required column exists before accessing it
     if 'report_date_as_yyyy_mm_dd' not in df.columns:
         return pd.DataFrame()  # Return empty DataFrame if key column is missing
-
+        
     keep = [
         "report_date_as_yyyy_mm_dd",
         "open_interest_all",
         "commercial_long_all",
         "commercial_short_all",
     ]
+    
+    # Only keep columns that exist in the dataframe
     keep = [col for col in keep if col in df.columns]
-
+    
+    # If we're missing essential columns, return empty DataFrame
     if "report_date_as_yyyy_mm_dd" not in keep:
         return pd.DataFrame()
-
+        
     df = df[keep]
     df = df.apply(pd.to_numeric, errors="ignore")
     df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
-
+    
+    # Only calculate commercial_net if the required columns exist
     if "commercial_long_all" in df.columns and "commercial_short_all" in df.columns:
         df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
-
+        
     return df.sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
-
-
-
-
-# app.py (Chunk 2)
 
 # ── METRICS ───────────────────────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -148,7 +140,7 @@ def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
     return out
 
 def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    if price.empty or cot.empty:
+    if price.empty:
         return pd.DataFrame()
     cot = cot.copy()
     cot["cot_date"] = cot["report_date_as_yyyy_mm_dd"] - pd.to_timedelta(
@@ -200,6 +192,9 @@ with st.spinner("Downloading & crunching …"):
         merged = add_health_gauge(merged)
         merged_data[t] = merged
 
+
+# app.py (Chunk 2)
+
 # ── VISUALISATIONS ────────────────────────────────────────────────────────────
 st.markdown("## Rolling Volatility")
 for t in tickers:
@@ -208,7 +203,7 @@ for t in tickers:
         st.warning(f"No data for {TICKER_TO_NAME[t]}")
         continue
     fig = px.line(df, x="date", y="rvol",
-                  title=f"{TICKER_TO_NAME[t]} — RVol ({rvol_window}-day)",
+                  title=f"{TICKER_TO_NAME[t]} -- RVol ({rvol_window}-day)",
                   template="plotly_white")
     fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig, use_container_width=True)
@@ -236,11 +231,20 @@ for t in tickers:
     if df.empty:
         continue
     fig = px.line(df, x="date", y="health_gauge",
-                  title=f"{TICKER_TO_NAME[t]} — Health Gauge",
+                  title=f"{TICKER_TO_NAME[t]} -- Health Gauge",
                   template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
 # ── PIP & RETURN DISTRIBUTION TREE ─────────────────────────────────────────────
+import calendar
+
+def _category_for_ticker(ticker: str) -> tuple[str, str]:
+    """Return (category, asset_name) for a given ticker"""
+    for category, tickers in ASSET_LEADERS.items():
+        if ticker in tickers:
+            return category, TICKER_TO_NAME.get(ticker, ticker)
+    return "", ticker
+
 def pip_and_return_tree_daily_pips(
     data: dict[str, pd.DataFrame], category: str, normalize: bool = True
 ) -> dict[str, dict]:
