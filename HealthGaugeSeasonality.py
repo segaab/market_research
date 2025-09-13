@@ -24,27 +24,34 @@ YH_SLEEP     = 0.2         # polite delay between tickers (sec)
 # ── MAPPINGS ──────────────────────────────────────────────────────────────────
 ASSET_LEADERS: Dict[str, List[str]] = {
     "Indices":       ["^GSPC"],
-    "Forex":         ["EURUSD=X", "JPY=X"],
+    "Forex":         ["EURUSD=X", "USDJPY=X"],
     "Agricultural":  ["ZS=F"],
     "Energy":        ["CL=F"],
     "Metals":        ["GC=F"],
 }
 
 TICKER_TO_NAME = {
-    "^GSPC":   "S&P 500",
-    "EURUSD=X":"EUR/USD",
-    "JPY=X":   "USD/JPY",
-    "ZS=F":    "Soybeans",
-    "CL=F":    "WTI Crude",
-    "GC=F":    "Gold",
+    "^GSPC":    "S&P 500",
+    "EURUSD=X": "EUR/USD",
+    "USDJPY=X": "USD/JPY",
+    "ZS=F":     "Soybeans",
+    "CL=F":     "WTI Crude",
+    "GC=F":     "Gold",
 }
 
-COT_NAMES = {
-    "EURUSD=X": "EURO FX -- Chicago Mercantile Exchange",
-    "JPY=X":     "JAPANESE YEN -- Chicago Mercantile Exchange",
-    "ZS=F":      "SOYBEANS -- Chicago Board of Trade",
-    "CL=F":      "WTI-PHYSICAL -- New York Mercantile Exchange",
-    "GC=F":      "GOLD -- Commodity Exchange Inc.",
+COT_ASSET_NAMES = {
+    # Indices
+    "^GSPC": "S&P 500 – Chicago Mercantile Exchange",
+    "^GDAXI": None,  # DAX not directly reported in CFTC COT
+
+    # Forex
+    "EURUSD=X": "EURO FX – Chicago Mercantile Exchange",
+    "USDJPY=X": "JAPANESE YEN – Chicago Mercantile Exchange",
+
+    # Commodities
+    "ZS=F": "SOYBEANS – Chicago Board of Trade",
+    "CL=F": "WTI-PHYSICAL – New York Mercantile Exchange",
+    "GC=F": "GOLD – Commodity Exchange Inc."
 }
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -61,30 +68,31 @@ def _yahoo_session() -> Ticker:
     "One shared YahooQuery client (re-uses HTTP session & cookies)."
     return Ticker([])          # empty now; symbols added per request
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_price_history(ticker: str) -> pd.DataFrame:
-    "Daily OHLCV from Yahoo; cached for 1 h."
+    "Daily OHLCV from YahooQuery; no longer cached here to allow threading."
     yq = _yahoo_session()
-    yq.symbols = [ticker]      # attach symbol dynamically
-    df = yq.history(start=START_DATE, end=END_DATE, auto_adjust=False)
+    yq.symbols = [ticker]
+    df = yq.history(start=START_DATE, end=END_DATE)
     if df.empty:
         return pd.DataFrame()
     df = df.reset_index()
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["return_pct"] = df["close"].pct_change() * 100
-    time.sleep(YH_SLEEP)       # polite spacing
+    time.sleep(YH_SLEEP)
     return df
 
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
-    "Weekly COT report; full-day cache"
+    "Weekly COT report"
+    if cot_name is None:
+        return pd.DataFrame()
     client = Socrata("publicreporting.cftc.gov", None, timeout=30)
     where = (
         f"market_and_exchange_names='{cot_name}' AND "
         f"report_date_as_yyyy_mm_dd >= '{start_date}' AND "
         f"report_date_as_yyyy_mm_dd <= '{end_date}'"
     )
+
     rows: List[dict] = []
     offset = 0
     while True:
@@ -98,8 +106,10 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
         if len(batch) < COT_PAGE_SIZE:
             break
         time.sleep(COT_SLEEP)
+
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame.from_records(rows)
     keep = [
         "report_date_as_yyyy_mm_dd",
@@ -152,24 +162,107 @@ def add_health_gauge(df: pd.DataFrame,
     )
     return out
 
-def _category_for_ticker(tkr: str) -> tuple[str | None, str | None]:
-    for cat, lst in ASSET_LEADERS.items():
-        if tkr in lst:
-            return cat, TICKER_TO_NAME[tkr]
-    return None, None
+# ── DAILY PIP & RETURN TREE ───────────────────────────────────────────────────
+def pip_and_return_tree_daily_pips(
+    data: dict[str, pd.DataFrame], category: str
+) -> dict[str, dict]:
+    """
+    JSON tree per asset:
+    - Each month (Jan…Dec) contains:
+        * 'daily_pip' → daily pip range stats
+        * 'return' → daily returns (%) stats
+    - 'Aggregate' node summarizes all months
+    """
+    tree: dict[str, dict] = {}
+
+
+
+
+
+for tkr, df in data.items():
+        cat, asset_name = _category_for_ticker(tkr)
+        if cat != category or df.empty:
+            continue
+
+        tmp = df.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"])
+        tmp = tmp.sort_values("date")
+        tmp["month_num"] = tmp["date"].dt.month
+
+        # calculate daily pip range
+        tmp["daily_pip"] = tmp["high"] - tmp["low"]
+
+        # calculate daily returns in %
+        tmp["return"] = tmp["close"].pct_change() * 100
+        tmp_returns = tmp.dropna(subset=["return"])
+        tmp_pips = tmp.dropna(subset=["daily_pip"])
+
+        month_dict: dict[str, dict] = {}
+
+        # ── monthly stats ───────────────────────────────────────────────
+        for m in range(1, 13):
+            # pip stats
+            month_data = tmp_pips[tmp_pips["month_num"] == m]
+            if month_data.empty:
+                continue
+            pip_stats = {
+                "min": round(month_data["daily_pip"].min(), 4),
+                "max": round(month_data["daily_pip"].max(), 4),
+                "mean": round(month_data["daily_pip"].mean(), 4),
+                "count": int(month_data["daily_pip"].count()),
+                "normalized": 0
+            }
+            pip_stats["normalized"] = pip_stats["count"] / len(tmp_pips)
+
+            # return stats
+            return_data = tmp_returns[tmp_returns["month_num"] == m]
+            return_stats = {
+                "min": round(return_data["return"].min(), 4),
+                "max": round(return_data["return"].max(), 4),
+                "mean": round(return_data["return"].mean(), 4),
+                "count": int(return_data["return"].count()),
+                "normalized": 0
+            }
+            return_stats["normalized"] = return_stats["count"] / len(tmp_returns)
+
+            month_name = calendar.month_abbr[m]
+            month_dict[month_name] = {"daily_pip": pip_stats, "return": return_stats}
+
+        # ── aggregate over all months ───────────────────────────────
+        agg_pip = {
+            "min": round(tmp_pips["daily_pip"].min(), 4),
+            "max": round(tmp_pips["daily_pip"].max(), 4),
+            "mean": round(tmp_pips["daily_pip"].mean(), 4),
+            "count": int(tmp_pips["daily_pip"].count()),
+            "normalized": 1.0
+        }
+        agg_return = {
+            "min": round(tmp_returns["return"].min(), 4),
+            "max": round(tmp_returns["return"].max(), 4),
+            "mean": round(tmp_returns["return"].mean(), 4),
+            "count": int(tmp_returns["return"].count()),
+            "normalized": 1.0
+        }
+        month_dict["Aggregate"] = {"daily_pip": agg_pip, "return": agg_return}
+
+        tree[asset_name] = month_dict
+
+    return tree
 
 # ── FETCH ALL DATA ────────────────────────────────────────────────────────────
 tickers = ASSET_LEADERS[category_selected]
+
 with st.spinner("Downloading & crunching …"):
-    # Yahoo prices in parallel --------------------------------------------------
+    # Yahoo prices in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         price_futs = {ex.submit(fetch_price_history, t): t for t in tickers}
         price_data = {price_futs[f]: f.result() for f in concurrent.futures.as_completed(price_futs)}
 
-    # COT sequential (cached & throttled) --------------------------------------
-    cot_data = {t: fetch_cot_data(COT_NAMES.get(t, ""), START_DATE, END_DATE) for t in tickers}
+    # COT sequential
+    cot_data = {t: fetch_cot_data(COT_ASSET_NAMES.get(t, None), START_DATE, END_DATE)
+                for t in tickers}
 
-    # Merge, rvol, health ------------------------------------------------------
+    # merge, rvol, health
     merged_data = {}
     for t in tickers:
         price = add_rvol(price_data[t], rvol_window)
@@ -177,35 +270,50 @@ with st.spinner("Downloading & crunching …"):
         merged = add_health_gauge(merged)
         merged_data[t] = merged
 
-# ── PIP DISTRIBUTION ──────────────────────────────────────────────────────────
-def pip_distribution_tree(data: dict[str, pd.DataFrame], category: str):
-    tree: dict[str, dict] = {}
-    month_list = [calendar.month_abbr[m] for m in range(1, 13)]
+# ── VISUALISATIONS ────────────────────────────────────────────────────────────
+st.markdown("## Rolling Volatility")
+for t in tickers:
+    df = merged_data[t]
+    if df.empty:
+        st.warning(f"No data for {TICKER_TO_NAME[t]}")
+        continue
+    fig = px.line(df, x="date", y="rvol",
+                  title=f"{TICKER_TO_NAME[t]} — RVol ({rvol_window}-day)",
+                  template="plotly_white")
+    fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
 
-    for tkr, df in data.items():
-        cat, asset_name = _category_for_ticker(tkr)
-        if cat != category or df.empty:
-            continue
-        tmp = df.copy()
-        tmp["month_num"] = pd.to_datetime(tmp["date"]).dt.month
+st.markdown("## Return Distribution")
+df_results = pd.concat(
+    [d.loc[d["return_pct"].notna(), ["return_pct"]].assign(asset=TICKER_TO_NAME[t])
+     for t, d in merged_data.items() if not d.empty],
+    ignore_index=True
+)
+if df_results.empty:
+    st.info("No return data available.")
+else:
+    fig = px.histogram(df_results, x="return_pct", nbins=20,
+                       color_discrete_sequence=["#3366CC"],
+                       title="Daily % Return Distribution")
+    fig.add_vline(x=0, line_dash="dash", line_color="red")
+    st.plotly_chart(fig, use_container_width=True)
 
-        monthly = (
-            tmp.groupby("month_num")["close"]
-            .agg(["min", "max", "mean", "count"])
-            .sort_index()
-        )
-        monthly["normalized"] = monthly["count"] / monthly["count"].sum()
+st.markdown("## Health Gauge")
+for t in tickers:
+    df = merged_data[t]
+    if df.empty:
+        continue
+    fig = px.line(df, x="date", y="health_gauge",
+                  title=f"{TICKER_TO_NAME[t]} — Health Gauge",
+                  template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
 
-        month_dict: dict[str, dict] = {}
-        for m, row in monthly.round(4).iterrows():
-            month_dict[calendar.month_abbr[m]] = row.to_dict()
-
-        agg_row = {
-            "min": round(tmp["close"].min(), 4),
-            "max": round(tmp["close"].max(), 4),
-            "mean": round(tmp["close"].mean(), 4),
-            "count": int(tmp["close"].count()),
-            "normalized": 1.0,
-        }
-        month_dict["Aggregate"] = agg_row
-        tree[asset_name] = month
+# ── JSON DOWNLOAD ─────────────────────────────────────────────────────────────
+st.markdown("## Download Daily Pip & Return Distribution JSON")
+pip_return_tree = pip_and_return_tree_daily_pips(merged_data, category_selected)
+st.download_button(
+    "Download JSON",
+    data=json.dumps(pip_return_tree, indent=2, default=str),
+    file_name=f"daily_pip_return_distribution_{category_selected}.json",
+    mime="application/json",
+)
