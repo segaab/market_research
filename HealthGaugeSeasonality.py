@@ -7,7 +7,6 @@ import time
 import calendar
 from datetime import datetime, timedelta
 from typing import Dict, List
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -27,7 +26,7 @@ COT_PAGE_SIZE = 15000
 COT_SLEEP = 0.35
 YH_SLEEP = 0.20
 
-# ── MAPPINGS ─────────────────────────────────────────────────────────────────
+# ── ASSET CONFIG ───────────────────────────────────────────────────────────
 ASSET_LEADERS: Dict[str, List[str]] = {
     "Indices": ["^GSPC"],
     "Forex": ["EURUSD=X", "USDJPY=X"],
@@ -54,39 +53,6 @@ COT_ASSET_NAMES = {
     "GC=F": "GOLD -- Commodity Exchange Inc."
 }
 
-ProfitableSeasonalMap: Dict[str, Dict] = {
-    "Indices": {
-        "S&P 500": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"✅","May":"⚪","Jun":"⚪",
-            "Jul":"⚪","Aug":"⚪","Sep":"❌","Oct":"✅","Nov":"✅","Dec":"✅"
-        }
-    },
-    "Forex": {
-        "EUR/USD": {
-            "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"⚪","Aug":"⚪","Sep":"✅","Oct":"⚪","Nov":"⚪","Dec":"⚪"
-        },
-        "USD/JPY": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪"
-        }
-    },
-    "Commodities": {
-        "Agricultural (Soybeans)": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪"
-        },
-        "Energy (Crude Oil)": {
-            "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"✅",
-            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"✅","Dec":"✅"
-        },
-        "Metals (Gold)": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"⚪","Aug":"⚪","Sep":"⚪","Oct":"✅","Nov":"✅","Dec":"✅"
-        }
-    }
-}
-
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 category_selected = st.sidebar.selectbox(
     "Choose Asset Category", list(ASSET_LEADERS.keys())
@@ -98,7 +64,9 @@ normalize_monthly_checkbox = st.sidebar.checkbox(
     "Normalize monthly distribution counts", value=True
 )
 
-# ── CACHING HELPERS ──────────────────────────────────────────────────────────
+# ── CACHING & FETCHING HELPERS ───────────────────────────────────────────────
+SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
+
 @st.cache_resource(show_spinner=False)
 def _yahoo_session() -> Ticker:
     return Ticker([])
@@ -117,8 +85,6 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     time.sleep(YH_SLEEP)
     return df
 
-# ── COT FETCH ───────────────────────────────────────────────────────────────
-SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     if not cot_name:
@@ -163,7 +129,7 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     )
     return df_daily.sort_values("timestamp").reset_index(drop=True)
 
-# ── METRICS & ACC/DIST ───────────────────────────────────────────────────────
+# ── METRIC HELPERS ─────────────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out = df.copy()
     if "volume" in out.columns:
@@ -172,140 +138,117 @@ def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
         out["rvol"] = np.nan
     return out
 
-def calculate_acc_dist_score(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["return"] = df["close"].pct_change().fillna(0)
-    df["acc_dist"] = 3  # neutral
-    if "rvol" not in df.columns:
-        df["rvol"] = 1
-    rvol_75 = df["rvol"].quantile(0.75)
-    df.loc[(df["return"] >= 0.02) & (df["rvol"] >= rvol_75), "acc_dist"] = 5
-    df.loc[(df["return"] >= 0.01) & (df["return"] < 0.02) & (df["rvol"] >= rvol_75*0.7), "acc_dist"] = 4
-    df.loc[(df["return"] <= -0.02) & (df["rvol"] >= rvol_75), "acc_dist"] = 0
-    df.loc[(df["return"] <= -0.01) & (df["return"] > -0.02) & (df["rvol"] >= rvol_75*0.7), "acc_dist"] = 1
-    return df
-
-def calculate_daily_health_gauge(price_df: pd.DataFrame, cot_df: pd.DataFrame) -> float:
-    if price_df.empty or cot_df.empty:
-        return np.nan
-    oi_series = price_df.get("open_interest_all", pd.Series()).dropna()
-    oi_score = 0.0 if oi_series.empty else float((oi_series.iloc[-1] - oi_series.min()) / (oi_series.max() - oi_series.min() + 1e-9))
-    st_score = lt_score = 0.0
-    if "commercial_net" in cot_df.columns and not cot_df.empty:
-        st_score = float((cot_df["commercial_net"].iloc[-1] - cot_df["commercial_net"].min()) /
-                         (cot_df["commercial_net"].max() - cot_df["commercial_net"].min() + 1e-9))
-    if "non_commercial_net" in cot_df.columns and not cot_df.empty:
-        lt_score = float((cot_df["non_commercial_net"].iloc[-1] - cot_df["non_commercial_net"].min()) /
-                         (cot_df["non_commercial_net"].max() - cot_df["non_commercial_net"].min() + 1e-9))
-    cot_score = 0.4 * st_score + 0.6 * lt_score
-    acc_mean = price_df["acc_dist"].mean() if "acc_dist" in price_df.columns else 0
-    return (0.25*oi_score + 0.35*cot_score + 0.4*acc_mean)*10
-
-def process_daily_tree(price_df: pd.DataFrame, cot_df: pd.DataFrame) -> list:
-    daily_list = []
-    for day, group in price_df.groupby(price_df["timestamp"].dt.date):
-        pip_range_24h = (group["high"] - group["low"]).tolist()
-        sd_pip_24h = group["high"].sub(group["low"]).rolling(1).std().fillna(0).tolist()
-        daily_mean = (group["high"] - group["low"]).mean()
-        daily_median = (group["high"] - group["low"]).median()
-        daily_health = calculate_daily_health_gauge(group, cot_df)
-        daily_list.append({
-            "date": str(day),
-            "month": day.month,
-            "pip_range_24h": pip_range_24h,
-            "daily_mean_pip": daily_mean,
-            "daily_median_pip": daily_median,
-            "sd_pip_24h": sd_pip_24h,
-            "daily_health_gauge": daily_health
-        })
-    return daily_list
-
-def process_monthly_tree(daily_list: list) -> list:
-    df = pd.DataFrame(daily_list)
-    if df.empty:
-        return []
-    df["date"] = pd.to_datetime(df["date"])
-    monthly_list = []
-    for month, group in df.groupby(df["date"].dt.month):
-        daily_returns = group["daily_mean_pip"].pct_change().fillna(0)
-        monthly_list.append({
-            "month": month,
-            "mean_return": daily_returns.mean(),
-            "median_return": daily_returns.median(),
-            "sd_return": daily_returns.std(),
-            "min_return": daily_returns.min(),
-            "max_return": daily_returns.max(),
-            "accuracy_percentage": (daily_returns>0).mean()*100
-        })
-    return monthly_list
-
-def fetch_process_asset(asset_name: str):
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_price = executor.submit(fetch_price_history, asset_name)
-        future_cot = executor.submit(fetch_cot_data, COT_ASSET_NAMES.get(asset_name,""), START_DATE, END_DATE)
-        price_df = future_price.result()
-        cot_df = future_cot.result()
+def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
+    if price.empty or cot.empty or "timestamp" not in cot.columns:
+        return pd.DataFrame()
     
-    if price_df.empty or cot_df.empty:
+    cot_copy = cot.copy()
+    cot_copy["cot_date"] = cot_copy["timestamp"] - pd.to_timedelta(cot_copy["timestamp"].dt.weekday - 4, unit="D")
+    cot_copy = cot_copy[["cot_date","commercial_long_all","commercial_short_all"]]
+    
+    merged = pd.merge_asof(
+        price.sort_values("timestamp"),
+        cot_copy.sort_values("cot_date"),
+        left_on="timestamp", right_on="cot_date", direction="backward"
+    ).drop(columns="cot_date")
+    
+    tot = (merged.get("commercial_long_all",0) + merged.get("commercial_short_all",0)).replace(0,np.nan)
+    merged["cot_long_norm"] = merged.get("commercial_long_all",0) / tot
+    merged["cot_short_norm"] = merged.get("commercial_short_all",0) / tot
+    
+    return merged
+
+def add_health_gauge(df: pd.DataFrame, weights: Dict[str,float] = {"rvol":0.5,"cot_long":0.3,"cot_short":0.2}) -> pd.DataFrame:
+    out = df.copy()
+    for col in ["rvol","cot_long_norm","cot_short_norm"]:
+        if col not in out.columns:
+            out[col] = 0
+    out["health_gauge"] = (
+        weights["rvol"]*out["rvol"].fillna(1) +
+        weights["cot_long"]*out["cot_long_norm"].fillna(0) -
+        weights["cot_short"]*out["cot_short_norm"].fillna(0)
+    )
+    return out
+
+def compute_daily_pip_range(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or not {"high","low"}.issubset(df.columns):
+        return pd.DataFrame()
+    df["pip_range"] = df["high"] - df["low"]
+    df["month"] = df["timestamp"].dt.to_period("M").dt.month
+    monthly_pip = df.groupby("month")["pip_range"].mean().reset_index()
+    return monthly_pip
+
+# ── FETCH + PROCESS ASSET ──────────────────────────────────────────────────
+def fetch_process_asset(ticker: str):
+    price = fetch_price_history(ticker)
+    cot = fetch_cot_data(COT_ASSET_NAMES.get(ticker,""), START_DATE, END_DATE)
+    if price.empty or cot.empty:
         return None, None
-
-    price_df = add_rvol(price_df, rvol_window)
-    price_df = calculate_acc_dist_score(price_df)
-
-    daily_tree = process_daily_tree(price_df, cot_df)
-    monthly_tree = process_monthly_tree(daily_tree)
+    price = add_rvol(price, rvol_window)
+    merged = merge_cot_price(cot, price)
+    health_df = add_health_gauge(merged)
+    
+    # Build daily JSON tree
+    daily_tree = health_df[[
+        "timestamp","close","rvol","cot_long_norm","cot_short_norm","health_gauge"
+    ]].rename(columns={"timestamp":"date"}).to_dict(orient="records")
+    
+    # Build monthly JSON tree
+    monthly = health_df.copy()
+    monthly["month"] = monthly["date"].dt.month
+    monthly_stats = monthly.groupby("month")["health_gauge"].mean().reset_index()
+    monthly_stats = monthly_stats.rename(columns={"health_gauge":"mean_health"})
+    monthly_tree = monthly_stats.to_dict(orient="records")
+    
     return daily_tree, monthly_tree
 
-# ── PROCESS CATEGORY ───────────────────────────────────────────────────────
 def process_category(category: str):
     tickers = ASSET_LEADERS.get(category, [])
     daily_json, monthly_json = {}, {}
 
     for t in tickers:
         st.info(f"Processing {TICKER_TO_NAME[t]}...")
-        daily_tree, monthly_tree = fetch_process_asset(t)
 
+        # Fetch and process asset
+        daily_tree, monthly_tree = fetch_process_asset(t)
         if daily_tree is None or monthly_tree is None:
-            st.warning(f"No data for {TICKER_TO_NAME[t]}")
+            st.warning(f"No data available for {TICKER_TO_NAME[t]}")
             continue
 
+        # Store JSON trees per ticker
         daily_json[t] = daily_tree
         monthly_json[t] = monthly_tree
 
-        # ── VISUALIZATION ──────────────────────────────────────────────
-        df_daily = pd.DataFrame(daily_tree)
-        if not df_daily.empty:
-            fig = px.line(
-                df_daily,
-                x="date",
-                y="daily_health_gauge",
-                title=f"Health Gauge - {TICKER_TO_NAME[t]}"
-            )
+        # Visualize health gauge
+        df_plot = pd.DataFrame(daily_tree)
+        if not df_plot.empty:
+            fig = px.line(df_plot, x="date", y="health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
             st.plotly_chart(fig, use_container_width=True)
 
+        # Visualize monthly stats
         df_monthly = pd.DataFrame(monthly_tree)
         if not df_monthly.empty:
             fig2 = px.bar(
                 df_monthly,
                 x="month",
-                y="mean_return",
-                title=f"Monthly Returns - {TICKER_TO_NAME[t]}"
+                y="mean_health",
+                title=f"Monthly Mean Health Gauge - {TICKER_TO_NAME[t]}"
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-    # ── JSON EXPORT ───────────────────────────────────────────────────────
-    if daily_json:
-        st.download_button(
-            label="Download Daily JSON Tree",
-            data=json.dumps({category: daily_json}, indent=2, default=str),
-            file_name=f"daily_tree_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
-        )
+    # ── JSON EXPORT ─────────────────────────────────────────────────────────
+    st.download_button(
+        label="Download Daily JSON Tree",
+        data=json.dumps(daily_json, indent=2, default=str),
+        file_name=f"daily_health_json_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json"
+    )
 
-    if monthly_json:
-        st.download_button(
-            label="Download Monthly JSON Tree",
-            data=json.dumps({category: monthly_json}, indent=2, default=str),
-            file_name=f"monthly_tree_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
-        )
+    st.download_button(
+        label="Download Monthly JSON Tree",
+        data=json.dumps(monthly_json, indent=2, default=str),
+        file_name=f"monthly_health_json_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json"
+    )
+
+    st.success(f"Processing complete for category: {category}")
