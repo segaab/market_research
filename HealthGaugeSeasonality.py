@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+8#!/usr/bin/env python3
 # -----------------------------------------------------------------------------
 # Multi-Asset Health Gauge – Streamlit application
 # -----------------------------------------------------------------------------
@@ -22,7 +22,7 @@ st.set_page_config(page_title="Multi-Asset Health Gauge", layout="wide")
 START_DATE = "2013-01-01"
 END_DATE   = datetime.today().strftime("%Y-%m-%d")
 
-COT_PAGE_SIZE = 15_000
+COT_PAGE_SIZE = 15000
 COT_SLEEP     = 0.35         # s between paged COT calls
 YH_SLEEP      = 0.20         # s between Yahoo sub-calls
 
