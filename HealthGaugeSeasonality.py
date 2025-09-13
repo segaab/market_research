@@ -26,7 +26,7 @@ COT_PAGE_SIZE = 15000
 COT_SLEEP = 0.35
 YH_SLEEP = 0.20
 
-# ── ASSET CONFIG ───────────────────────────────────────────────────────────
+# ── MAPPINGS ─────────────────────────────────────────────────────────────────
 ASSET_LEADERS: Dict[str, List[str]] = {
     "Indices": ["^GSPC"],
     "Forex": ["EURUSD=X", "USDJPY=X"],
@@ -53,6 +53,39 @@ COT_ASSET_NAMES = {
     "GC=F": "GOLD -- Commodity Exchange Inc."
 }
 
+ProfitableSeasonalMap: Dict[str, Dict] = {
+    "Indices": {
+        "S&P 500": {
+            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"✅","May":"⚪","Jun":"⚪",
+            "Jul":"⚪","Aug":"⚪","Sep":"❌","Oct":"✅","Nov":"✅","Dec":"✅"
+        }
+    },
+    "Forex": {
+        "EUR/USD": {
+            "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+            "Jul":"⚪","Aug":"⚪","Sep":"✅","Oct":"⚪","Nov":"⚪","Dec":"⚪"
+        },
+        "USD/JPY": {
+            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪"
+        }
+    },
+    "Commodities": {
+        "Agricultural (Soybeans)": {
+            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪"
+        },
+        "Energy (Crude Oil)": {
+            "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"✅",
+            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"✅","Dec":"✅"
+        },
+        "Metals (Gold)": {
+            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+            "Jul":"⚪","Aug":"⚪","Sep":"⚪","Oct":"✅","Nov":"✅","Dec":"✅"
+        }
+    }
+}
+
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 category_selected = st.sidebar.selectbox(
     "Choose Asset Category", list(ASSET_LEADERS.keys())
@@ -64,9 +97,7 @@ normalize_monthly_checkbox = st.sidebar.checkbox(
     "Normalize monthly distribution counts", value=True
 )
 
-# ── CACHING & FETCHING HELPERS ───────────────────────────────────────────────
-SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
-
+# ── CACHING HELPERS ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _yahoo_session() -> Ticker:
     return Ticker([])
@@ -84,6 +115,9 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     df["return_pct"] = df["close"].pct_change() * 100
     time.sleep(YH_SLEEP)
     return df
+
+# ── COT FETCH ───────────────────────────────────────────────────────────────
+SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -129,7 +163,7 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     )
     return df_daily.sort_values("timestamp").reset_index(drop=True)
 
-# ── METRIC HELPERS ─────────────────────────────────────────────────────────
+# ── METRICS ────────────────────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out = df.copy()
     if "volume" in out.columns:
@@ -158,6 +192,7 @@ def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
     
     return merged
 
+# ── HEALTH GAUGE ─────────────────────────────────────────────────────────────
 def add_health_gauge(df: pd.DataFrame, weights: Dict[str,float] = {"rvol":0.5,"cot_long":0.3,"cot_short":0.2}) -> pd.DataFrame:
     out = df.copy()
     for col in ["rvol","cot_long_norm","cot_short_norm"]:
@@ -170,85 +205,122 @@ def add_health_gauge(df: pd.DataFrame, weights: Dict[str,float] = {"rvol":0.5,"c
     )
     return out
 
-def compute_daily_pip_range(df: pd.DataFrame) -> pd.DataFrame:
+# ── DAILY PIP RANGE & STATS ─────────────────────────────────────────────────
+def compute_daily_pip_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or not {"high","low"}.issubset(df.columns):
         return pd.DataFrame()
-    df["pip_range"] = df["high"] - df["low"]
+    df_daily = df.copy()
+    df_daily["pip_range"] = df_daily["high"] - df_daily["low"]
+    daily_stats = df_daily.groupby(df_daily["timestamp"].dt.date).agg(
+        pip_range_24h=("pip_range", lambda x: list(x)),
+        daily_mean_pip=("pip_range", "mean"),
+        daily_median_pip=("pip_range", "median"),
+        sd_pip_24h=("pip_range", lambda x: list(np.std(x, ddof=1))),
+        daily_health_gauge=("health_gauge", "mean")
+    ).reset_index().rename(columns={"timestamp":"date"})
+    return daily_stats
+
+# ── MONTHLY RETURNS & PROFITABILITY ──────────────────────────────────────────
+def compute_monthly_returns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
     df["month"] = df["timestamp"].dt.to_period("M").dt.month
-    monthly_pip = df.groupby("month")["pip_range"].mean().reset_index()
-    return monthly_pip
+    monthly_returns = df.groupby("month")["return_pct"].sum().reset_index()
+    return monthly_returns
 
-# ── FETCH + PROCESS ASSET ──────────────────────────────────────────────────
-def fetch_process_asset(ticker: str):
-    price = fetch_price_history(ticker)
-    cot = fetch_cot_data(COT_ASSET_NAMES.get(ticker,""), START_DATE, END_DATE)
-    if price.empty or cot.empty:
-        return None, None
-    price = add_rvol(price, rvol_window)
-    merged = merge_cot_price(cot, price)
-    health_df = add_health_gauge(merged)
-    
-    # Build daily JSON tree
-    daily_tree = health_df[[
-        "timestamp","close","rvol","cot_long_norm","cot_short_norm","health_gauge"
-    ]].rename(columns={"timestamp":"date"}).to_dict(orient="records")
-    
-    # Build monthly JSON tree
-    monthly = health_df.copy()
-    monthly["month"] = monthly["date"].dt.month
-    monthly_stats = monthly.groupby("month")["health_gauge"].mean().reset_index()
-    monthly_stats = monthly_stats.rename(columns={"health_gauge":"mean_health"})
-    monthly_tree = monthly_stats.to_dict(orient="records")
-    
-    return daily_tree, monthly_tree
+def assign_profit_labels(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    q33,q77 = df["return_pct"].quantile([0.33,0.77])
+    df["profit_label"] = np.where(df["return_pct"]>=q77,"Profitable",
+                          np.where(df["return_pct"]<=q33,"Unprofitable","Average"))
+    return df
 
+def calculate_accuracy(df: pd.DataFrame, asset_name: str, category: str) -> float:
+    if df.empty:
+        return 0.0
+    top_key = "Commodities" if category in ("Agricultural","Energy","Metals") else category
+    monthly_map = ProfitableSeasonalMap.get(top_key,{}).get(asset_name,{})
+    df["expected"] = df["month"].map(lambda m: monthly_map.get(calendar.month_abbr[m],"⚪"))
+    df["actual_hit"] = df.apply(lambda x: 1 if ((x["expected"]=="✅" and x["profit_label"]=="Profitable") or (x["expected"]=="❌" and x["profit_label"]=="Unprofitable")) else 0, axis=1)
+    return round(df["actual_hit"].mean()*100,2)
+
+# ── PROCESS CATEGORY ─────────────────────────────────────────────────────────
 def process_category(category: str):
-    tickers = ASSET_LEADERS.get(category, [])
-    daily_json, monthly_json = {}, {}
+    tickers = ASSET_LEADERS.get(category,[])
+    merged_data = {}
+    monthly_distribution = {}
+    accuracy_stats = {}
+    pip_range_stats = {}
+    healthgauge_dfs = {}
 
     for t in tickers:
-        st.info(f"Processing {TICKER_TO_NAME[t]}...")
+        # FETCH
+        price = fetch_price_history(t)
+        cot = fetch_cot_data(COT_ASSET_NAMES.get(t,""), START_DATE, END_DATE)
 
-        # Fetch and process asset
-        daily_tree, monthly_tree = fetch_process_asset(t)
-        if daily_tree is None or monthly_tree is None:
-            st.warning(f"No data available for {TICKER_TO_NAME[t]}")
+        # PROCESS
+        price = add_rvol(price, rvol_window)
+        health_df = add_health_gauge(merge_cot_price(cot, price))
+        healthgauge_dfs[t] = health_df
+        merged_data[t] = health_df.copy()
+
+        monthly = compute_monthly_returns(health_df)
+        monthly = assign_profit_labels(monthly)
+        monthly_distribution[t] = monthly
+        accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category)
+
+        pip_range_stats[t] = compute_daily_pip_stats(health_df)
+
+    # ── JSON EXPORT
+    payload_merged = {
+        t: pip_range_stats[t].round(6).fillna("").to_dict(orient="records")
+        for t in pip_range_stats if not pip_range_stats[t].empty
+    }
+
+    monthly_payload = {
+        t: monthly_distribution[t].round(6).fillna("").to_dict(orient="records")
+        for t in monthly_distribution if not monthly_distribution[t].empty
+    }
+
+    accuracy_payload = {t: {"accuracy_pct": accuracy_stats[t]} for t in accuracy_stats}
+
+    st.download_button(
+        label="Download Daily Health + Pip Stats JSON",
+        data=json.dumps(payload_merged, indent=2, default=str),
+        file_name=f"daily_health_pip_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json"
+    )
+
+    st.download_button(
+        label="Download Monthly Stats JSON",
+        data=json.dumps({"monthly_returns": monthly_payload, "accuracy_distribution": accuracy_payload}, indent=2, default=str),
+        file_name=f"monthly_stats_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json"
+    )
+
+    # ── VISUALIZATION
+    for t in tickers:
+        if t not in merged_data or merged_data[t].empty:
             continue
+        df_plot = merged_data[t]
+        fig = px.line(df_plot, x="date", y="daily_health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
+        st.plotly_chart(fig, use_container_width=True)
 
-        # Store JSON trees per ticker
-        daily_json[t] = daily_tree
-        monthly_json[t] = monthly_tree
-
-        # Visualize health gauge
-        df_plot = pd.DataFrame(daily_tree)
-        if not df_plot.empty:
-            fig = px.line(df_plot, x="date", y="health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Visualize monthly stats
-        df_monthly = pd.DataFrame(monthly_tree)
-        if not df_monthly.empty:
+        monthly_df = monthly_distribution[t]
+        if not monthly_df.empty:
             fig2 = px.bar(
-                df_monthly,
+                monthly_df,
                 x="month",
-                y="mean_health",
-                title=f"Monthly Mean Health Gauge - {TICKER_TO_NAME[t]}"
+                y="return_pct",
+                color="profit_label",
+                title=f"Monthly Return Distribution - {TICKER_TO_NAME[t]}"
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-    # ── JSON EXPORT ─────────────────────────────────────────────────────────
-    st.download_button(
-        label="Download Daily JSON Tree",
-        data=json.dumps(daily_json, indent=2, default=str),
-        file_name=f"daily_health_json_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
-    )
+        st.write(f"Profitability Accuracy: {accuracy_stats[t]}%")
 
-    st.download_button(
-        label="Download Monthly JSON Tree",
-        data=json.dumps(monthly_json, indent=2, default=str),
-        file_name=f"monthly_health_json_{category}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
-    )
+# ── RUN PROCESS ON CATEGORY SELECTION
+process_category(category_selected)
 
-    st.success(f"Processing complete for category: {category}")
+st.write("### Script Version: Daily Health Gauge + Pip Stats + Monthly Returns JSON Export")
