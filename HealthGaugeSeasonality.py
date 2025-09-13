@@ -5,7 +5,7 @@
 import json
 import time
 import calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
 
 import numpy as np
@@ -19,8 +19,9 @@ import concurrent.futures
 # ── APP CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Multi-Asset Health Gauge", layout="wide")
 
-END_DATE = datetime.today().strftime("%Y-%m-%d")
-START_DATE = (datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+LATEST_DATE = datetime.today()
+START_DATE = (LATEST_DATE - timedelta(days=365*10)).strftime("%Y-%m-%d")
+END_DATE = LATEST_DATE.strftime("%Y-%m-%d")
 
 COT_PAGE_SIZE = 15000
 COT_SLEEP = 0.35
@@ -55,34 +56,22 @@ COT_ASSET_NAMES = {
 
 ProfitableSeasonalMap: Dict[str, Dict] = {
     "Indices": {
-        "S&P 500": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"✅","May":"⚪","Jun":"⚪",
-            "Jul":"⚪","Aug":"⚪","Sep":"❌","Oct":"✅","Nov":"✅","Dec":"✅"
-        }
+        "S&P 500": { "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"✅","May":"⚪","Jun":"⚪",
+                     "Jul":"⚪","Aug":"⚪","Sep":"❌","Oct":"✅","Nov":"✅","Dec":"✅" }
     },
     "Forex": {
-        "EUR/USD": {
-            "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"⚪","Aug":"⚪","Sep":"✅","Oct":"⚪","Nov":"⚪","Dec":"⚪"
-        },
-        "USD/JPY": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪"
-        }
+        "EUR/USD": { "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+                     "Jul":"⚪","Aug":"⚪","Sep":"✅","Oct":"⚪","Nov":"⚪","Dec":"⚪" },
+        "USD/JPY": { "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+                     "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪" }
     },
     "Commodities": {
-        "Agricultural (Soybeans)": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪"
-        },
-        "Energy (Crude Oil)": {
-            "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"✅",
-            "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"✅","Dec":"✅"
-        },
-        "Metals (Gold)": {
-            "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
-            "Jul":"⚪","Aug":"⚪","Sep":"⚪","Oct":"✅","Nov":"✅","Dec":"✅"
-        }
+        "Agricultural (Soybeans)": { "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+                                      "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"⚪","Dec":"⚪" },
+        "Energy (Crude Oil)": { "Jan":"✅","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"✅",
+                                "Jul":"✅","Aug":"⚪","Sep":"⚪","Oct":"⚪","Nov":"✅","Dec":"✅" },
+        "Metals (Gold)": { "Jan":"⚪","Feb":"⚪","Mar":"⚪","Apr":"⚪","May":"⚪","Jun":"⚪",
+                           "Jul":"⚪","Aug":"⚪","Sep":"⚪","Oct":"✅","Nov":"✅","Dec":"✅" }
     }
 }
 
@@ -96,6 +85,9 @@ rvol_window = st.sidebar.number_input(
 normalize_monthly_checkbox = st.sidebar.checkbox(
     "Normalize monthly distribution counts", value=True
 )
+
+
+
 
 # ── CACHING HELPERS ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
@@ -118,6 +110,7 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
 
 # ── COT FETCH ───────────────────────────────────────────────────────────────
 SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
+
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     if not cot_name:
@@ -163,14 +156,14 @@ def fetch_cot_data(cot_name: str, start_date: str, end_date: str) -> pd.DataFram
     )
     return df_daily.sort_values("timestamp").reset_index(drop=True)
 
-# ── METRICS & CALCULATIONS ───────────────────────────────────────────────────
+# ── METRICS & HEALTH GAUGE ───────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out = df.copy()
     out["rvol"] = out["volume"] / out["volume"].rolling(window).mean().replace(0, np.nan)
     return out
 
 def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    if price.empty:
+    if price.empty or cot.empty or "timestamp" not in cot.columns:
         return pd.DataFrame()
     cot = cot.copy()
     cot["cot_date"] = cot["timestamp"] - pd.to_timedelta(cot["timestamp"].dt.weekday - 4, unit="D")
@@ -181,8 +174,8 @@ def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
         left_on="timestamp", right_on="cot_date", direction="backward"
     ).drop(columns="cot_date")
     tot = (merged["commercial_long_all"] + merged["commercial_short_all"]).replace(0, np.nan)
-    merged["cot_long_norm"] = merged["commercial_long_all"]/tot
-    merged["cot_short_norm"] = merged["commercial_short_all"]/tot
+    merged["cot_long_norm"] = merged["commercial_long_all"] / tot
+    merged["cot_short_norm"] = merged["commercial_short_all"] / tot
     return merged
 
 def add_health_gauge(df: pd.DataFrame, weights: Dict[str,float] = {"rvol":0.5, "cot_long":0.3, "cot_short":0.2}) -> pd.DataFrame:
@@ -216,8 +209,9 @@ def calculate_accuracy(df: pd.DataFrame, asset_name: str, category: str) -> floa
     top_key = "Commodities" if category in ("Agricultural","Energy","Metals") else category
     monthly_map = ProfitableSeasonalMap.get(top_key, {}).get(asset_name, {})
     df["expected"] = df["month"].map(lambda m: monthly_map.get(calendar.month_abbr[m],"⚪"))
-    df["actual_hit"] = df.apply(lambda x: 1 if ((x["expected"]=="✅" and x["profit_label"]=="Profitable") or (x["expected"]=="❌" and x["profit_label"]=="Unprofitable")) else 0, axis=1)
-    return round(df["actual_hit"].mean()*100,2)
+    df["actual_hit"] = df.apply(lambda x: 1 if ((x["expected"]=="✅" and x["profit_label"]=="Profitable") or
+                                                (x["expected"]=="❌" and x["profit_label"]=="Unprofitable")) else 0, axis=1)
+    return round(df["actual_hit"].mean()*100, 2)
 
 # ── DAILY PIP RANGE ─────────────────────────────────────────────────────────
 def compute_daily_pip_range(df: pd.DataFrame) -> pd.DataFrame:
@@ -229,130 +223,105 @@ def compute_daily_pip_range(df: pd.DataFrame) -> pd.DataFrame:
     return monthly_pip
 
 # ── FETCH, MERGE & CALCULATE ───────────────────────────────────────────────
-tickers = ASSET_LEADERS[category_selected]
-merged_data = {}
-monthly_distribution = {}
-accuracy_stats = {}
-pip_range_stats = {}
-
-for t in tickers:
-    price = fetch_price_history(t)
-    cot = fetch_cot_data(COT_ASSET_NAMES.get(t,""), START_DATE, END_DATE)
-    price = add_rvol(price, rvol_window)
-    merged = add_health_gauge(merge_cot_price(cot, price))
-    merged_data[t] = merged
-
-    monthly = compute_monthly_returns(merged)
-    monthly = assign_profit_labels(monthly)
-    monthly_distribution[t] = monthly
-    accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category_selected)
-
-    pip_range_stats[t] = compute_daily_pip_range(price)
-
-# ── JSON EXPORT ─────────────────────────────────────────────────────────────
-export_cols = ["timestamp","close","rvol","cot_long_norm","cot_short_norm","health_gauge","return_pct","profit_label"]
-payload_merged = {
-    t: d[export_cols].round(6).fillna("").to_dict(orient="records")
-    for t,d in merged_data.items() if not d.empty
-}
-
-monthly_payload = {
-    t: monthly_distribution[t].round(6).fillna("").to_dict(orient="records")
-    for t in monthly_distribution if not monthly_distribution[t].empty
-}
-
-accuracy_payload = {t: {"accuracy_pct": accuracy_stats[t]} for t in accuracy_stats}
-
-pip_payload = {
-    t: pip_range_stats[t].round(6).fillna("").to_dict(orient="records")
-    for t in pip_range_stats if not pip_range_stats[t].empty
-}
-
-full_json_payload = {
-    "merged_data": payload_merged
-}
-
-distribution_json_payload = {
-    "standard": {
-        "monthly_returns": monthly_payload,
-        "accuracy_distribution": accuracy_payload,
-        "monthly_pip_range": pip_payload
-    },
-    "enhanced": {
-        # Could add normalized counts or percentile ranks here if needed
-        "monthly_returns": monthly_payload,
-        "accuracy_distribution": accuracy_payload,
-        "monthly_pip_range": pip_payload
-    }
-}
-
-st.download_button(
-    label="Download Health Gauge JSON",
-    data=json.dumps(full_json_payload, indent=2, default=str),
-    file_name=f"health_gauge_data_{datetime.now().strftime('%Y%m%d')}.json",
-    mime="application/json"
-)
-
-st.download_button(
-    label="Download Distribution Stats JSON",
-    data=json.dumps(distribution_json_payload, indent=2, default=str),
-    file_name=f"health_gauge_distribution_{category_selected}_{datetime.now().strftime('%Y%m%d')}.json",
-    mime="application/json"
-)
-
-# ── VISUALIZATION ──────────────────────────────────────────────────────────
-for t in tickers:
-    if t not in merged_data or merged_data[t].empty:
-        continue
-    df_plot = merged_data[t]
-    fig = px.line(df_plot, x="timestamp", y="health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
-    st.plotly_chart(fig, use_container_width=True)
-
-    monthly_df = monthly_distribution[t]
-    if not monthly_df.empty:
-        fig2 = px.bar(
-            monthly_df,
-            x="month",
-            y="return_pct",
-            color="profit_label",
-            title=f"Monthly Return Distribution - {TICKER_TO_NAME[t]}"
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.write(f"Profitability Accuracy: {accuracy_stats[t]}%")
-
-
-
-
-
-
-
-
-st.write("### Script Version: Monthly Return Distribution + Pip Stats + JSON Export")
-
-# ── ASSET GROUP SELECTION TRIGGER ─────────────────────────────────────────────
-def refresh_on_category_change():
-    global merged_data, monthly_distribution, accuracy_stats, pip_range_stats
-
-    tickers = ASSET_LEADERS[category_selected]
+def process_category(category: str):
+    tickers = ASSET_LEADERS[category]
     merged_data = {}
+    merged_healthgauge = {}
     monthly_distribution = {}
     accuracy_stats = {}
     pip_range_stats = {}
 
     for t in tickers:
         price = fetch_price_history(t)
-        cot = fetch_cot_data(COT_ASSET_NAMES.get(t,""), START_DATE, END_DATE)
+        cot = fetch_cot_data(COT_ASSET_NAMES.get(t, ""), START_DATE, END_DATE)
         price = add_rvol(price, rvol_window)
-        merged = add_health_gauge(merge_cot_price(cot, price))
+        merged = merge_cot_price(cot, price)
+        health_df = add_health_gauge(merged)
         merged_data[t] = merged
+        merged_healthgauge[t] = health_df
 
-        monthly = compute_monthly_returns(merged)
+        monthly = compute_monthly_returns(health_df)
         monthly = assign_profit_labels(monthly)
         monthly_distribution[t] = monthly
-        accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category_selected)
+        accuracy_stats[t] = calculate_accuracy(monthly, TICKER_TO_NAME[t], category)
 
         pip_range_stats[t] = compute_daily_pip_range(price)
 
-# Run refresh whenever asset group is selected
-refresh_on_category_change()
+    # ── JSON EXPORT ─────────────────────────────────────────────────────────
+    export_cols = ["timestamp", "close", "rvol", "cot_long_norm", "cot_short_norm", "health_gauge", "return_pct", "profit_label"]
+    payload_merged = {
+        t: merged_data[t][export_cols].round(6).fillna("").to_dict(orient="records")
+        for t in merged_data if not merged_data[t].empty
+    }
+
+    payload_healthgauge = {
+        t: merged_healthgauge[t][export_cols].round(6).fillna("").to_dict(orient="records")
+        for t in merged_healthgauge if not merged_healthgauge[t].empty
+    }
+
+    monthly_payload = {
+        t: monthly_distribution[t].round(6).fillna("").to_dict(orient="records")
+        for t in monthly_distribution if not monthly_distribution[t].empty
+    }
+
+    accuracy_payload = {t: {"accuracy_pct": accuracy_stats[t]} for t in accuracy_stats}
+
+    pip_payload = {
+        t: pip_range_stats[t].round(6).fillna("").to_dict(orient="records")
+        for t in pip_range_stats if not pip_range_stats[t].empty
+    }
+
+    full_json_payload = {
+        category: {
+            "merged_data": payload_merged,
+            "merged_healthgauge": payload_healthgauge
+        }
+    }
+
+    distribution_json_payload = {
+        category: {
+            "monthly_returns": monthly_payload,
+            "accuracy_distribution": accuracy_payload,
+            "monthly_pip_range": pip_payload
+        }
+    }
+
+    st.download_button(
+        label="Download Health Gauge JSON",
+        data=json.dumps(full_json_payload, indent=2, default=str),
+        file_name=f"health_gauge_data_{category}_{datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json"
+    )
+
+    st.download_button(
+        label="Download Distribution Stats JSON",
+        data=json.dumps(distribution_json_payload, indent=2, default=str),
+        file_name=f"health_gauge_distribution_{category}_{datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json"
+    )
+
+    # ── VISUALIZATION ──────────────────────────────────────────────────────
+    for t in tickers:
+        if t not in merged_healthgauge or merged_healthgauge[t].empty:
+            continue
+        df_plot = merged_healthgauge[t]
+        fig = px.line(df_plot, x="timestamp", y="health_gauge", title=f"Health Gauge - {TICKER_TO_NAME[t]}")
+        st.plotly_chart(fig, use_container_width=True)
+
+        monthly_df = monthly_distribution[t]
+        if not monthly_df.empty:
+            fig2 = px.bar(
+                monthly_df,
+                x="month",
+                y="return_pct",
+                color="profit_label",
+                title=f"Monthly Return Distribution - {TICKER_TO_NAME[t]}"
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.write(f"Profitability Accuracy: {accuracy_stats[t]}%")
+
+# ── RUN PROCESS ON CATEGORY SELECTION ───────────────────────────────────────
+process_category(category_selected)
+
+st.write("### Script Version: Monthly Return Distribution + Pip Stats + JSON Export with Merged HealthGauge")
