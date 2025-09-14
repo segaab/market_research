@@ -2,7 +2,7 @@
 # -----------------------------------------------------------------------------
 # Multi-Asset Health Gauge  ·  threaded, batched CFTC downloads (10-year proof)
 # -----------------------------------------------------------------------------
-import json, time, calendar, math, threading
+import json, time, calendar, math, threading, logging
 from datetime import datetime, timedelta
 from typing import Dict, List, DefaultDict, Tuple
 from collections import defaultdict
@@ -30,7 +30,14 @@ RETRY_BACKOFF_SECS = 1.5
 COT_PAGE_SIZE = 15_000           # Socrata max is 50 000
 YH_SLEEP      = 0.15
 
-# ── MAPPINGS (unchanged) ─────────────────────────────────────────────────────
+# ── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+# ── MAPPINGS ─────────────────────────────────────────────────────────────────
 ASSET_LEADERS: Dict[str, List[str]] = {
     "Indices": ["^GSPC"],
     "Forex": ["EURUSD=X", "USDJPY=X"],
@@ -50,7 +57,6 @@ COT_ASSET_NAMES = {
     "CL=F": "WTI-PHYSICAL -- New York Mercantile Exchange",
     "GC=F": "GOLD -- Commodity Exchange Inc.",
 }
-# … ProfitableSeasonalMap unchanged – omitted for brevity …
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 category_selected = st.sidebar.selectbox("Choose Asset Category", ASSET_LEADERS.keys())
@@ -61,16 +67,20 @@ SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
 
 @st.cache_resource(show_spinner=False)
 def _yq_session(symbols: List[str]) -> Ticker:
+    logging.info(f"Initializing YahooQuery session for: {symbols}")
     return Ticker(symbols, asynchronous=False)
 
 @st.cache_resource(show_spinner=False)
 def _cot_client() -> Socrata:
+    logging.info("Initializing Socrata CFTC client")
     return Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=120)
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_price_history(ticker: str) -> pd.DataFrame:
+    logging.info(f"Fetching price history for {ticker}")
     df = _yq_session([ticker]).history(start=START_DATE, end=END_DATE)
     if df.empty:
+        logging.warning(f"No price data found for {ticker}")
         return pd.DataFrame()
     df = df.reset_index()
     df["timestamp"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
@@ -88,6 +98,7 @@ def _month_chunks(start: str, end: str) -> List[Tuple[str, str]]:
 
 def _fetch_cot_chunk(cot_name: str, date_pair: Tuple[str, str], client: Socrata) -> pd.DataFrame:
     sd, ed = date_pair
+    logging.info(f"Fetching COT chunk for {cot_name} from {sd} to {ed}")
     where_clause = (
         f"market_and_exchange_names='{cot_name}' AND "
         f"report_date_as_yyyy_mm_dd >= '{sd}' AND report_date_as_yyyy_mm_dd <= '{ed}'"
@@ -107,14 +118,12 @@ def _fetch_cot_chunk(cot_name: str, date_pair: Tuple[str, str], client: Socrata)
         offset += COT_PAGE_SIZE
         if len(batch) < COT_PAGE_SIZE:
             break
-    df = pd.DataFrame.from_records(rows)
-    return df
+    return pd.DataFrame.from_records(rows)
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
     if not cot_name:
         return pd.DataFrame()
-
     client = _cot_client()
     results = []
 
@@ -126,6 +135,7 @@ def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
             except HTTPError as e:
                 retries += 1
                 if retries > MAX_RETRIES:
+                    logging.error(f"CFTC API failed for chunk {pair}: {e}")
                     st.error(f"CFTC API failed for chunk {pair}: {e}")
                     return pd.DataFrame()
                 time.sleep(RETRY_BACKOFF_SECS * (2 ** (retries - 1)))
@@ -134,10 +144,13 @@ def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
         futures = {exe.submit(worker, p): p for p in _month_chunks(start, end)}
         for fut in as_completed(futures):
             results.append(fut.result())
+            logging.info(f"Completed chunk {futures[fut]} for {cot_name}")
 
     df = pd.concat(results, ignore_index=True)
     if df.empty:
+        logging.warning(f"No COT data returned for {cot_name}")
         return df
+
     df["timestamp"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
     if {"commercial_long_all", "commercial_short_all"} <= set(df.columns):
         df["commercial_net"] = df["commercial_long_all"] - df["commercial_short_all"]
@@ -153,7 +166,7 @@ def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
     )
     return daily.sort_values("timestamp").reset_index(drop=True)
 
-# ── REMAINDER: metrics helpers (identical to previous answer) ────────────────
+# ── METRICS HELPERS ─────────────────────────────────────────────────────────
 def add_rvol(df: pd.DataFrame, win: int) -> pd.DataFrame:
     out = df.copy()
     out["rvol"] = out["volume"] / out["volume"].rolling(win).mean().replace(0, np.nan)
@@ -200,6 +213,7 @@ def assign_profit_labels(df: pd.DataFrame) -> pd.DataFrame:
                           np.where(df["return_pct"] <= q1, "Unprofitable", "Average"))
     return df
 
+# ── ACCURACY CALCULATION ─────────────────────────────────────────────────────
 def calculate_accuracy(df: pd.DataFrame, asset: str, cat: str) -> float:
     if df.empty: return 0.0
     top = "Commodities" if cat in ("Agricultural", "Energy", "Metals") else cat
@@ -209,7 +223,6 @@ def calculate_accuracy(df: pd.DataFrame, asset: str, cat: str) -> float:
         lambda x: 1 if ((x["expected"] == "✅" and x["profit_label"] == "Profitable") or
                         (x["expected"] == "❌" and x["profit_label"] == "Unprofitable")) else 0, axis=1)
     return round(df["hit"].mean() * 100, 2)
-
 
 # ── PROCESS CATEGORY ─────────────────────────────────────────────────────────
 def process_category(category: str):
@@ -222,10 +235,12 @@ def process_category(category: str):
     monthly_acc_reg  : DefaultDict[int, List[float]]       = defaultdict(list)
 
     for tk in tickers:
-        price = add_rvol(fetch_price_history(tk), rvol_window)
-        cot   = fetch_cot_data(COT_ASSET_NAMES[tk], START_DATE, END_DATE)
-        df    = add_health_gauge(merge_cot_price(cot, price))
-        merged_data[tk] = df
+        with st.spinner(f"Fetching data for {TICKER_TO_NAME[tk]}"):
+            logging.info(f"Processing {tk} ({TICKER_TO_NAME[tk]})")
+            price = add_rvol(fetch_price_history(tk), rvol_window)
+            cot   = fetch_cot_data(COT_ASSET_NAMES[tk], START_DATE, END_DATE)
+            df    = add_health_gauge(merge_cot_price(cot, price))
+            merged_data[tk] = df
 
         # ---- daily registries ---------------------------------------------
         for _, r in df.iterrows():
@@ -287,7 +302,7 @@ def process_category(category: str):
         mime="application/json",
     )
 
-    # ── VISUALS (unchanged) -------------------------------------------------
+    # ── VISUALS -------------------------------------------------------------
     for tk in tickers:
         df = merged_data[tk]
         if df.empty: continue
@@ -301,7 +316,9 @@ def process_category(category: str):
                                    title=f"Monthly Return – {TICKER_TO_NAME[tk]}"),
                             use_container_width=True)
         st.markdown(f"**Seasonality accuracy:** {accuracy_stats[tk]} %")
+        logging.info(f"Finished visualizing {tk}")
 
 # ── RUN APP ──────────────────────────────────────────────────────────────────
 process_category(category_selected)
 st.write("### Script Version : threaded CFTC fetch + daily & monthly JSON export")
+logging.info("Completed processing category: " + category_selected)
