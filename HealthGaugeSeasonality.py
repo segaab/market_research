@@ -37,6 +37,18 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
+# ── GLOBAL LOG STORAGE ─────────────────────────────────────────────────────
+log_messages: List[str] = []
+
+def log_and_store(level: str, msg: str):
+    log_messages.append(f"[{level}] {msg}")
+    if level == "INFO":
+        logging.info(msg)
+    elif level == "WARNING":
+        logging.warning(msg)
+    else:
+        logging.error(msg)
+
 # ── MAPPINGS ─────────────────────────────────────────────────────────────────
 ASSET_LEADERS: Dict[str, List[str]] = {
     "Indices": ["^GSPC"],
@@ -72,10 +84,11 @@ def fetch_with_backoff(func: Callable, *args: Any, max_retries: int = 5,
         except (ConnectionError, Timeout, RequestException) as e:
             retries += 1
             if retries > max_retries:
-                logging.error(f"Max retries ({max_retries}) exceeded: {e}")
+                log_and_store("ERROR", f"Max retries ({max_retries}) exceeded: {e}")
                 raise
+            
             delay = base_delay * (2 ** (retries - 1)) * (0.5 + random.random())
-            logging.warning(f"Request failed (attempt {retries}/{max_retries}): {e}. Retrying in {delay:.2f} seconds")
+            log_and_store("WARNING", f"Request failed (attempt {retries}/{max_retries}): {e}. Retrying in {delay:.2f}s")
             time.sleep(delay)
 
 # ── FETCHING HELPERS ─────────────────────────────────────────────────────────
@@ -83,22 +96,22 @@ SODAPY_APP_TOKEN = "WSCaavlIcDgtLVZbJA1FKkq40"
 
 @st.cache_resource(show_spinner=False)
 def _yq_session(symbols: List[str]) -> Ticker:
-    logging.info(f"Initializing YahooQuery session for: {symbols}")
+    log_and_store("INFO", f"Initializing YahooQuery session for: {symbols}")
     return Ticker(symbols, asynchronous=False)
 
 @st.cache_resource(show_spinner=False)
 def _cot_client() -> Socrata:
-    logging.info("Initializing Socrata CFTC client")
+    log_and_store("INFO", "Initializing Socrata CFTC client")
     return Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=120)
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_price_history(ticker: str) -> pd.DataFrame:
-    logging.info(f"Fetching price history for {ticker}")
+    log_and_store("INFO", f"Fetching price history for {ticker}")
     
     def _fetch():
         df = _yq_session([ticker]).history(start=START_DATE, end=END_DATE)
         if df.empty:
-            logging.warning(f"No price data found for {ticker}")
+            log_and_store("WARNING", f"No price data found for {ticker}")
             return pd.DataFrame()
         df = df.reset_index()
         df["timestamp"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
@@ -118,7 +131,7 @@ def _month_chunks(start: str, end: str) -> List[Tuple[str, str]]:
 
 def _fetch_cot_chunk(cot_name: str, date_pair: Tuple[str, str], client: Socrata) -> pd.DataFrame:
     sd, ed = date_pair
-    logging.info(f"Fetching COT chunk for {cot_name} from {sd} to {ed}")
+    log_and_store("INFO", f"Fetching COT chunk for {cot_name} from {sd} to {ed}")
     where_clause = (
         f"market_and_exchange_names='{cot_name}' AND "
         f"report_date_as_yyyy_mm_dd >= '{sd}' AND report_date_as_yyyy_mm_dd <= '{ed}'"
@@ -155,7 +168,7 @@ def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
         try:
             return _fetch_cot_chunk(cot_name, pair, client)
         except Exception as e:
-            logging.error(f"CFTC API failed for chunk {pair}: {e}")
+            log_and_store("ERROR", f"CFTC API failed for chunk {pair}: {e}")
             st.error(f"CFTC API failed for chunk {pair}: {e}")
             return pd.DataFrame()
 
@@ -163,11 +176,11 @@ def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
         futures = {exe.submit(worker, p): p for p in _month_chunks(start, end)}
         for fut in as_completed(futures):
             results.append(fut.result())
-            logging.info(f"Completed chunk {futures[fut]} for {cot_name}")
+            log_and_store("INFO", f"Completed chunk {futures[fut]} for {cot_name}")
 
     df = pd.concat(results, ignore_index=True)
     if df.empty:
-        logging.warning(f"No COT data returned for {cot_name}")
+        log_and_store("WARNING", f"No COT data returned for {cot_name}")
         return df
 
     df["timestamp"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"])
@@ -184,171 +197,85 @@ def fetch_cot_data(cot_name: str, start: str, end: str) -> pd.DataFrame:
     )
     return daily.sort_values("timestamp").reset_index(drop=True)
 
-# ── METRICS HELPERS ─────────────────────────────────────────────────────────
-def add_rvol(df: pd.DataFrame, win: int) -> pd.DataFrame:
-    if df.empty or "volume" not in df.columns:
-        df["rvol"] = np.nan
-        return df
-    out = df.copy()
-    out["rvol"] = out["volume"] / out["volume"].rolling(win).mean().replace(0, np.nan)
-    return out
-
-def merge_cot_price(cot: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    if price.empty or cot.empty:
-        return pd.DataFrame()
-    cot2 = cot.copy()
-    cot2["cot_date"] = cot2["timestamp"] - pd.to_timedelta(cot2["timestamp"].dt.weekday - 4, unit="D")
-    cot2 = cot2[["cot_date", "commercial_long_all", "commercial_short_all"]]
-    merged = pd.merge_asof(
-        price.sort_values("timestamp"),
-        cot2.sort_values("cot_date"),
-        left_on="timestamp",
-        right_on="cot_date",
-        direction="backward",
-    ).drop(columns="cot_date")
-    tot = (merged["commercial_long_all"] + merged["commercial_short_all"]).replace(0, np.nan)
-    merged["cot_long_norm"]  = merged["commercial_long_all"]  / tot
-    merged["cot_short_norm"] = merged["commercial_short_all"] / tot
-    return merged
-
-def add_health_gauge(df: pd.DataFrame, w: Dict[str, float] = {"rvol": .5, "cot_long": .3, "cot_short": .2}) -> pd.DataFrame:
-    out = df.copy()
-    # Ensure columns exist to avoid KeyError
-    for col in ["rvol", "cot_long_norm", "cot_short_norm"]:
-        if col not in out.columns:
-            out[col] = 0.0 if "cot" in col else 1.0
-    out["health_gauge"] = (
-        w["rvol"]      * out["rvol"].fillna(1)
-        + w["cot_long"]  * out["cot_long_norm"].fillna(0)
-        - w["cot_short"] * out["cot_short_norm"].fillna(0)
-    )
-    return out
 
 
-# ── MONTHLY RETURNS & PROFIT LABELS ───────────────────────────────────────────
-def compute_monthly_returns(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "return_pct" not in df.columns:
-        return pd.DataFrame()
-    df["month"] = df["timestamp"].dt.to_period("M")
-    out = df.groupby("month")["return_pct"].sum().reset_index()
-    out["month_name"] = out["month"].dt.strftime("%B")
-    return out
+# ── Daily Registry ────────────────────────────────────────────────
+        if not df.empty and "health_gauge" in df.columns:
+            for idx, row in df.iterrows():
+                if pd.notna(row["health_gauge"]):
+                    daily_hg_reg[idx].append(row["health_gauge"])
+                if "pip_change" in df.columns and pd.notna(row["pip_change"]):
+                    daily_pip_reg[idx].append(row["pip_change"])
 
-def assign_profit_labels(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "return_pct" not in df.columns:
-        return df
-    q1, q3 = df["return_pct"].quantile([.33, .77])
-    df["profit_label"] = np.where(df["return_pct"] >= q3, "Profitable",
-                          np.where(df["return_pct"] <= q1, "Unprofitable", "Average"))
-    return df
+        # ── Monthly Registry ──────────────────────────────────────────────
+        if not df.empty and "pip_change" in df.columns:
+            monthly = df.resample("M").mean(numeric_only=True)
+            for idx, row in monthly.iterrows():
+                month = idx.month
+                if pd.notna(row["pip_change"]):
+                    monthly_ret_reg[month].append(row["pip_change"])
+                if pd.notna(row["health_gauge"]):
+                    monthly_acc_reg[month].append(row["health_gauge"])
 
-# ── ACCURACY CALCULATION ─────────────────────────────────────────────────────
-def calculate_accuracy(df: pd.DataFrame, asset: str, cat: str) -> float:
-    if df.empty or "month" not in df.columns or "return_pct" not in df.columns:
-        return 0.0
-    top = "Commodities" if cat in ("Agricultural", "Energy", "Metals") else cat
-    seasonal = ProfitableSeasonalMap.get(top, {}).get(asset, {})
-    df["expected"] = df["month"].dt.month.map(lambda m: seasonal.get(calendar.month_abbr[m], "⚪"))
-    df["hit"] = df.apply(
-        lambda x: 1 if ((x["expected"] == "✅" and x["profit_label"] == "Profitable") or
-                        (x["expected"] == "❌" and x["profit_label"] == "Unprofitable")) else 0, axis=1)
-    return round(df["hit"].mean() * 100, 2)
-
-# ── PROCESS CATEGORY ─────────────────────────────────────────────────────────
-def process_category(category: str):
-    tickers = ASSET_LEADERS[category]
-
-    merged_data, monthly_distribution, accuracy_stats = {}, {}, {}
-    daily_pip_reg : DefaultDict[pd.Timestamp, List[float]] = defaultdict(list)
-    daily_hg_reg  : DefaultDict[pd.Timestamp, List[float]] = defaultdict(list)
-    monthly_ret_reg  : DefaultDict[int, List[float]]       = defaultdict(list)
-    monthly_acc_reg  : DefaultDict[int, List[float]]       = defaultdict(list)
-
-    for tk in tickers:
-        with st.spinner(f"Fetching data for {TICKER_TO_NAME[tk]}"):
-            logging.info(f"Processing {tk} ({TICKER_TO_NAME[tk]})")
-            price = add_rvol(fetch_price_history(tk), rvol_window)
-            cot   = fetch_cot_data(COT_ASSET_NAMES[tk], START_DATE, END_DATE)
-            df    = add_health_gauge(merge_cot_price(cot, price))
-            merged_data[tk] = df
-
-        # ---- daily registries ---------------------------------------------
-        for _, r in df.iterrows():
-            d = r["timestamp"].normalize()
-            if not math.isnan(r.get("pip_range", np.nan)):
-                daily_pip_reg[d].append(round(r["pip_range"], 4))
-            daily_hg_reg[d].append(round(r.get("health_gauge", 0), 4))
-
-        # ---- monthly registries -------------------------------------------
-        mdf = assign_profit_labels(compute_monthly_returns(df))
-        monthly_distribution[tk] = mdf
-        acc = calculate_accuracy(mdf, TICKER_TO_NAME[tk], category)
-        accuracy_stats[tk] = acc
-        for _, r in mdf.iterrows():
-            m = r["month"].month
-            monthly_ret_reg[m].append(round(r.get("return_pct", 0), 4))
-            monthly_acc_reg[m].append(acc)
-
-    # ── DAILY JSON ----------------------------------------------------------
-    daily_json = []
-    for dt in sorted(daily_pip_reg):
-        pips = daily_pip_reg[dt]
-        hgs  = daily_hg_reg[dt]
-        daily_json.append({
+    # ── Daily JSON ───────────────────────────────────────────────────────
+    daily_json = [
+        {
             "date": dt.strftime("%Y-%m-%d"),
-            "month": dt.month,
-            "pip_range_24h": pips,
-            "daily_mean_pip": round(float(np.mean(pips)), 4),
-            "daily_median_pip": round(float(np.median(pips)), 4),
-            "sd_pip_24h": round(float(np.std(pips, ddof=0)), 4),
-            "daily_health_gauge": round(float(np.mean(hgs)), 4),
-        })
+            "avg_pip": float(np.mean(vals_pip)) if vals_pip else None,
+            "avg_hg": float(np.mean(vals_hg)) if vals_hg else None,
+        }
+        for dt, vals_pip, vals_hg in [
+            (dt, daily_pip_reg[dt], daily_hg_reg[dt]) for dt in sorted(daily_pip_reg.keys())
+        ]
+    ]
+    log_and_store("INFO", f"Daily JSON entries -> {len(daily_json)}")
 
-    # ── MONTHLY JSON --------------------------------------------------------
-    monthly_json = []
-    for m in range(1, 13):
-        if m not in monthly_ret_reg: continue
-        rets = monthly_ret_reg[m]
-        monthly_json.append({
-            "month": calendar.month_name[m],
-            "monthly_return": rets,
-            "accuracy_pct": round(float(np.mean(monthly_acc_reg[m])), 2),
-            "mean_return": round(float(np.mean(rets)), 4),
-            "median_return": round(float(np.median(rets)), 4),
-            "sd_return": round(float(np.std(rets, ddof=0)), 4),
-        })
+    # ── Monthly JSON ─────────────────────────────────────────────────────
+    monthly_json = [
+        {
+            "month": month,
+            "avg_return": float(np.mean(monthly_ret_reg[month])) if monthly_ret_reg[month] else None,
+            "avg_acc": float(np.mean(monthly_acc_reg[month])) if monthly_acc_reg[month] else None,
+        }
+        for month in sorted(monthly_ret_reg.keys())
+    ]
+    log_and_store("INFO", f"Monthly JSON entries -> {len(monthly_json)}")
 
-    # ── DOWNLOAD BUTTONS ----------------------------------------------------
-    st.download_button(
-        "Download Daily Health Gauge + Pip Stats (JSON)",
-        data=json.dumps({category: daily_json}, indent=2),
-        file_name=f"daily_health_pip_{category}_{datetime.now():%Y%m%d_%H%M%S}.json",
-        mime="application/json",
-    )
-    st.download_button(
-        "Download Monthly Stats (JSON)",
-        data=json.dumps({category: monthly_json}, indent=2),
-        file_name=f"monthly_stats_{category}_{datetime.now():%Y%m%d_%H%M%S}.json",
-        mime="application/json",
-    )
+    # ── Export JSON ──────────────────────────────────────────────────────
+    with open(f"{category}_daily.json", "w") as f:
+        json.dump(daily_json, f, indent=2)
+    with open(f"{category}_monthly.json", "w") as f:
+        json.dump(monthly_json, f, indent=2)
+    log_and_store("INFO", f"Exported JSON for {category}")
 
-    # ── VISUALS -------------------------------------------------------------
-    for tk in tickers:
-        df = merged_data[tk]
-        if df.empty: continue
-        st.plotly_chart(px.line(df, x="timestamp", y="health_gauge",
-                                title=f"Health Gauge -- {TICKER_TO_NAME[tk]}"),
-                        use_container_width=True)
-        mdf = monthly_distribution[tk]
-        if not mdf.empty:
-            st.plotly_chart(px.bar(mdf, x=mdf['month'].dt.strftime('%Y-%m'),
-                                   y="return_pct", color="profit_label",
-                                   title=f"Monthly Return -- {TICKER_TO_NAME[tk]}"),
-                            use_container_width=True)
-        st.markdown(f"**Seasonality accuracy:** {accuracy_stats[tk]} %")
-        logging.info(f"Finished visualizing {tk}")
+    return merged_data, monthly_json, daily_json
 
-# ── RUN APP ──────────────────────────────────────────────────────────────────
-process_category(category_selected)
-st.write("### Script Version : threaded CFTC fetch + daily & monthly JSON export")
-logging.info("Completed processing category: " + category_selected)
+
+# ── Streamlit UI ─────────────────────────────────────────────────────────
+st.title("📊 Multi-Asset Health Gauge Dashboard (with Diagnostics)")
+
+category_selected = st.selectbox("Choose Category", list(ASSET_LEADERS.keys()))
+rvol_window = st.slider("Rolling Volatility Window", 5, 60, 20)
+
+if st.button("Run Analysis"):
+    merged_data, monthly_json, daily_json = process_category(category_selected)
+
+    # Visualization: show one example chart if data exists
+    if merged_data:
+        for tk, df in merged_data.items():
+            if not df.empty and "health_gauge" in df.columns:
+                st.line_chart(df["health_gauge"])
+                break
+
+    # Show JSON preview
+    st.subheader("Daily JSON (preview)")
+    st.json(daily_json[:5])
+    st.subheader("Monthly JSON (preview)")
+    st.json(monthly_json[:5])
+
+    # ── Diagnostic Log ────────────────────────────────────────────────
+    st.subheader("Diagnostic Log")
+    for msg in log_messages:
+        st.text(msg)
+
+st.write("### Script Version: threaded CFTC fetch + JSON export + diagnostics")
